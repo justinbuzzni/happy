@@ -251,7 +251,11 @@ export async function startDaemon(): Promise<void> {
 
         // Resolve authentication token if provided
         const authEnv: Record<string, string> = {};
-        if (options.token) {
+        if (options.token && options.secret) {
+          // Happy server auth: token + secret pair from web UI
+          authEnv.HAPPY_AUTH_TOKEN = options.token;
+          authEnv.HAPPY_AUTH_SECRET = options.secret;
+        } else if (options.token) {
           if (options.agent === 'codex') {
 
             // Create a temporary directory for Codex

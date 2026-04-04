@@ -123,6 +123,7 @@ export interface SpawnSessionOptions {
     agent?: 'claude' | 'codex' | 'gemini' | 'openclaw';
     environmentVariables?: Record<string, string>;
     token?: string;
+    secret?: string;
 }
 
 export type SpawnSessionResult =

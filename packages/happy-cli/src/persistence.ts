@@ -226,6 +226,17 @@ export type Credentials = {
 }
 
 export async function readCredentials(): Promise<Credentials | null> {
+  // Environment variable override: allows web UI to pass user-specific credentials
+  if (process.env.HAPPY_AUTH_TOKEN && process.env.HAPPY_AUTH_SECRET) {
+    return {
+      token: process.env.HAPPY_AUTH_TOKEN,
+      encryption: {
+        type: 'legacy',
+        secret: new Uint8Array(Buffer.from(process.env.HAPPY_AUTH_SECRET, 'base64'))
+      }
+    };
+  }
+
   if (!existsSync(configuration.privateKeyFile)) {
     return null
   }
