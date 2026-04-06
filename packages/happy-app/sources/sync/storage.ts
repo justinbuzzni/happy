@@ -21,6 +21,7 @@ import { isMutableTool } from "@/components/tools/knownTools";
 import { projectManager } from "./projectManager";
 import { DecryptedArtifact } from "./artifactTypes";
 import { FeedItem } from "./feedTypes";
+import { sessionUpdateMetadata } from "./ops";
 
 // Debounce timer for realtimeMode changes
 let realtimeModeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -492,17 +493,22 @@ export const storage = create<StorageState>()((set, get) => {
             let changed = new Set<string>();
             let hasReadyEvent = false;
 
-            // Check if any incoming messages contain EnterPlanMode tool calls
+            // Check if any incoming messages contain EnterPlanMode or change_title tool calls
             let shouldEnterPlanMode = false;
+            let newTitle: string | null = null;
             for (const msg of messages) {
                 if (msg.role === 'agent') {
                     for (const c of msg.content) {
                         if (c.type === 'tool-call' && (c.name === 'EnterPlanMode' || c.name === 'enter_plan_mode')) {
                             shouldEnterPlanMode = true;
-                            break;
+                        }
+                        if (c.type === 'tool-call' && c.name === 'mcp__happy__change_title') {
+                            const title = (c.input as { title?: string })?.title;
+                            if (typeof title === 'string') {
+                                newTitle = title;
+                            }
                         }
                     }
-                    if (shouldEnterPlanMode) break;
                 }
             }
 
@@ -547,7 +553,7 @@ export const storage = create<StorageState>()((set, get) => {
                 // IMPORTANT: We extract latestUsage from the mutable reducerState and copy it to the Session object
                 // This ensures latestUsage is available immediately on load, even before messages are fully loaded
                 let updatedSessions = state.sessions;
-                const needsUpdate = (reducerResult.todos !== undefined || existingSession.reducerState.latestUsage || shouldEnterPlanMode) && session;
+                const needsUpdate = (reducerResult.todos !== undefined || existingSession.reducerState.latestUsage || shouldEnterPlanMode || newTitle) && session;
 
                 if (needsUpdate) {
                     updatedSessions = {
@@ -560,7 +566,14 @@ export const storage = create<StorageState>()((set, get) => {
                                 ...existingSession.reducerState.latestUsage
                             } : session.latestUsage,
                             // Auto-switch to plan mode when EnterPlanMode tool call is detected
-                            ...(shouldEnterPlanMode && { permissionMode: 'plan' })
+                            ...(shouldEnterPlanMode && { permissionMode: 'plan' }),
+                            // Update session title when mcp__happy__change_title tool call is detected
+                            ...(newTitle && session.metadata && {
+                                metadata: {
+                                    ...session.metadata,
+                                    summary: { text: newTitle, updatedAt: Date.now() }
+                                }
+                            })
                         }
                     };
                 }
@@ -591,6 +604,36 @@ export const storage = create<StorageState>()((set, get) => {
                     }
                 });
                 saveSessionPermissionModes(allModes);
+            }
+
+            // Persist title change to server
+            if (newTitle) {
+                const currentState = get();
+                const session = currentState.sessions[sessionId];
+                if (session?.metadata) {
+                    sessionUpdateMetadata(
+                        sessionId,
+                        session.metadata,
+                        session.metadataVersion
+                    ).then((result) => {
+                        // Update local metadataVersion to stay in sync with server
+                        set((state) => {
+                            const s = state.sessions[sessionId];
+                            if (s) {
+                                return {
+                                    ...state,
+                                    sessions: {
+                                        ...state.sessions,
+                                        [sessionId]: { ...s, metadataVersion: result.version }
+                                    }
+                                };
+                            }
+                            return state;
+                        });
+                    }).catch((error) => {
+                        console.error('Failed to persist session title to server:', error);
+                    });
+                }
             }
 
             return { changed: Array.from(changed), hasReadyEvent };
