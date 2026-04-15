@@ -11,6 +11,7 @@ import { projectPath } from "@/projectPath";
 import { systemPrompt } from "./utils/systemPrompt";
 import type { SandboxConfig } from "@/persistence";
 import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
+import { filterCredentialsFromEnv } from "@/sandbox/config";
 
 /**
  * Error thrown when the Claude process exits with a non-zero exit code.
@@ -235,12 +236,11 @@ export async function claudeLocal(opts: {
             }
 
             // Prepare environment variables
-            // Note: Local mode uses global Claude installation with --session-id flag
-            // Launcher only intercepts fetch for thinking state tracking
-            const env = {
-                ...process.env,
-                ...opts.claudeEnvVars
-            }
+            // When sandbox is enabled, filter out credentials to prevent exposure
+            const baseEnv = opts.sandboxConfig?.enabled
+                ? filterCredentialsFromEnv({ ...process.env, ...opts.claudeEnvVars })
+                : { ...process.env, ...opts.claudeEnvVars };
+            const env = baseEnv;
 
             logger.debug(`[ClaudeLocal] Spawning launcher: ${claudeCliPath}`);
             logger.debug(`[ClaudeLocal] Args: ${JSON.stringify(args)}`);

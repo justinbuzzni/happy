@@ -14,7 +14,7 @@ import { encodeBase64 } from '@/api/encryption';
 import { logger } from '@/ui/logger';
 
 export const SandboxConfigSchema = z.object({
-  enabled: z.boolean().default(false),
+  enabled: z.boolean().default(true),
   workspaceRoot: z.string().optional(),
   sessionIsolation: z.enum(['strict', 'workspace', 'custom']).default('workspace'),
   customWritePaths: z.array(z.string()).default([]),

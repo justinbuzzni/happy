@@ -22,6 +22,7 @@ import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
+import { filterCredentialsFromEnv } from '@/sandbox/config';
 import { detectCLIAvailability } from '@/utils/detectCLI';
 import { buildResumeLaunch } from '@/resume/handleResumeCommand';
 import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -346,6 +347,9 @@ export async function startDaemon(): Promise<void> {
           };
         }
 
+        // Check if sandbox is enabled (for credential filtering)
+        const hasSandbox = extraEnv.HAPPY_PROJECT_SANDBOX_CONFIG !== undefined;
+
         // Check if tmux is available and should be used
         const tmuxAvailable = await isTmuxAvailable();
         let useTmux = tmuxAvailable;
@@ -382,17 +386,11 @@ export async function startDaemon(): Promise<void> {
           // 2. Regular spawn uses env: { ...process.env, ...extraEnv }
           // 3. tmux needs explicit environment via -e flags to ensure all variables are available
           const windowName = `happy-${Date.now()}-${agent}`;
-          const tmuxEnv: Record<string, string> = {};
-
-          // Add all daemon environment variables (filtering out undefined)
-          for (const [key, value] of Object.entries(process.env)) {
-            if (value !== undefined) {
-              tmuxEnv[key] = value;
-            }
-          }
-
-          // Add extra environment variables (these should already be filtered)
-          Object.assign(tmuxEnv, extraEnv);
+          // Filter credentials from daemon env when sandbox is enabled
+          const daemonEnvFiltered = hasSandbox
+            ? filterCredentialsFromEnv(process.env)
+            : Object.fromEntries(Object.entries(process.env).filter(([, v]) => v !== undefined)) as Record<string, string>;
+          const tmuxEnv: Record<string, string> = { ...daemonEnvFiltered, ...extraEnv };
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
             sessionName: tmuxSessionName,
@@ -491,7 +489,7 @@ export async function startDaemon(): Promise<void> {
             args,
             cwd: directory,
             env: {
-              ...process.env,
+              ...(hasSandbox ? filterCredentialsFromEnv(process.env) : process.env),
               ...extraEnv
             },
             directoryCreated,
