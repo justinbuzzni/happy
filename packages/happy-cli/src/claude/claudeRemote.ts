@@ -12,6 +12,7 @@ import { awaitFileExist } from "@/modules/watcher/awaitFileExist";
 import { systemPrompt } from "./utils/systemPrompt";
 import { PermissionResult } from "./sdk/types";
 import type { JsRuntime } from "./runClaude";
+import { ORCHESTRATOR_SYSTEM_PROMPT } from "@/orchestrator/workerMcp";
 
 export async function claudeRemote(opts: {
 
@@ -28,6 +29,10 @@ export async function claudeRemote(opts: {
     hookSettingsPath: string,
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime,
+    /** Orchestrator mode: inject worker MCP tools and system prompt */
+    orchestratorMode?: boolean,
+    /** MCP servers to add for orchestrator worker management */
+    orchestratorMcpServers?: Record<string, unknown>,
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
@@ -113,15 +118,20 @@ export async function claudeRemote(opts: {
 
     // Prepare SDK options
     let mode = initial.mode;
+    const orchestratorPromptSuffix = opts.orchestratorMode ? '\n\n' + ORCHESTRATOR_SYSTEM_PROMPT : '';
+    const mergedMcpServers = {
+        ...opts.mcpServers,
+        ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
+    };
     const sdkOptions: QueryOptions = {
         cwd: opts.path,
         resume: startFrom ?? undefined,
-        mcpServers: opts.mcpServers,
+        mcpServers: Object.keys(mergedMcpServers).length > 0 ? mergedMcpServers : opts.mcpServers,
         permissionMode: mapToClaudeMode(initial.mode.permissionMode),
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,
         customSystemPrompt: initial.mode.customSystemPrompt ? initial.mode.customSystemPrompt + '\n\n' + systemPrompt : undefined,
-        appendSystemPrompt: initial.mode.appendSystemPrompt ? initial.mode.appendSystemPrompt + '\n\n' + systemPrompt : systemPrompt,
+        appendSystemPrompt: (initial.mode.appendSystemPrompt ? initial.mode.appendSystemPrompt + '\n\n' + systemPrompt : systemPrompt) + orchestratorPromptSuffix,
         allowedTools: initial.mode.allowedTools ? initial.mode.allowedTools.concat(opts.allowedTools) : opts.allowedTools,
         disallowedTools: initial.mode.disallowedTools,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal }) => opts.canCallTool(toolName, input, mode, options),
