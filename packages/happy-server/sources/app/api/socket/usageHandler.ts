@@ -2,6 +2,8 @@ import { Socket } from "socket.io";
 import { AsyncLock } from "@/utils/lock";
 import { db } from "@/storage/db";
 import { buildUsageEphemeral, eventRouter } from "@/app/events/eventRouter";
+import { persistSessionEvent } from "@/app/events/persistSessionEvent";
+import { SESSION_EVENT_TYPES } from "@/app/events/sessionEventTypes";
 import { log } from "@/utils/log";
 
 export function usageHandler(userId: string, socket: Socket) {
@@ -96,6 +98,15 @@ export function usageHandler(userId: string, socket: Socket) {
                             userId,
                             payload: usageEvent,
                             recipientFilter: { type: 'user-scoped-only' }
+                        });
+
+                        // Persist usage-report event to durable log
+                        persistSessionEvent({
+                            sessionId,
+                            eventType: SESSION_EVENT_TYPES.USAGE_REPORT,
+                            content: '',
+                        }).catch(error => {
+                            log({ module: 'websocket', level: 'error' }, `Failed to persist usage-report event: ${error}`);
                         });
                     }
 

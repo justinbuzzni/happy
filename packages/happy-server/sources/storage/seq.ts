@@ -27,6 +27,30 @@ export async function allocateSessionSeq(sessionId: string) {
     return seq;
 }
 
+export async function allocateSessionEventSeq(sessionId: string) {
+    const session = await db.session.update({
+        where: { id: sessionId },
+        select: { eventSeq: true },
+        data: { eventSeq: { increment: 1 } }
+    });
+    return session.eventSeq;
+}
+
+export async function allocateSessionEventSeqBatch(sessionId: string, count: number, tx?: SeqClient) {
+    if (count <= 0) {
+        return [] as number[];
+    }
+    const client = resolveClient(tx);
+    const session = await client.session.update({
+        where: { id: sessionId },
+        select: { eventSeq: true },
+        data: { eventSeq: { increment: count } }
+    });
+    const endSeq = session.eventSeq;
+    const startSeq = endSeq - count + 1;
+    return Array.from({ length: count }, (_, index) => startSeq + index);
+}
+
 export async function allocateSessionSeqBatch(sessionId: string, count: number, tx?: SeqClient) {
     if (count <= 0) {
         return [] as number[];

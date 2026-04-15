@@ -101,11 +101,13 @@ model Session {
     agentStateVersion Int              @default(0)
     dataEncryptionKey Bytes?
     seq               Int              @default(0)
+    eventSeq          Int              @default(0)
     active            Boolean          @default(true)
     lastActiveAt      DateTime         @default(now())
     createdAt         DateTime         @default(now())
     updatedAt         DateTime         @updatedAt
     messages          SessionMessage[]
+    events            SessionEvent[]
     usageReports      UsageReport[]
     accessKeys        AccessKey[]
 
@@ -126,6 +128,21 @@ model SessionMessage {
 
     @@unique([sessionId, localId])
     @@index([sessionId, seq])
+}
+
+model SessionEvent {
+    id        String   @id @default(cuid())
+    sessionId String
+    session   Session  @relation(fields: [sessionId], references: [id])
+    eventType String
+    seq       Int
+    /// [SessionEventContent]
+    content   Json
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+
+    @@index([sessionId, seq])
+    @@index([sessionId, eventType])
 }
 
 //

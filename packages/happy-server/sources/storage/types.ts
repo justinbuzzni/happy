@@ -6,6 +6,12 @@ declare global {
         // Session message content types
         type SessionMessageContent = WireSessionMessageContent;
 
+        // Session event content types
+        type SessionEventContent = {
+            t: 'encrypted';
+            c: string;
+        };
+
         // Usage report data structure
         type UsageReportData = {
             tokens: {

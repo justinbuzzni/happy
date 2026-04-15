@@ -6,6 +6,8 @@ import { allocateSessionSeq, allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
 import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
+import { persistSessionEvent } from "@/app/events/persistSessionEvent";
+import { SESSION_EVENT_TYPES } from "@/app/events/sessionEventTypes";
 import { Socket } from "socket.io";
 
 export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection) {
@@ -281,6 +283,15 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 userId,
                 payload: sessionActivity,
                 recipientFilter: { type: 'user-scoped-only' }
+            });
+
+            // Persist session-end event to durable log
+            persistSessionEvent({
+                sessionId: sid,
+                eventType: SESSION_EVENT_TYPES.SESSION_END,
+                content: '',
+            }).catch(error => {
+                log({ module: 'websocket', level: 'error' }, `Failed to persist session-end event: ${error}`);
             });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-end: ${error}`);
