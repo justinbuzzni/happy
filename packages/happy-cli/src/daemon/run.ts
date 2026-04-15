@@ -176,15 +176,22 @@ export async function startDaemon(): Promise<void> {
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
 
     // Serialize tracked sessions for disk persistence
+    const sessionStartTimes = new Map<number, number>();
+    for (const s of pidToTrackedSession.values()) {
+      sessionStartTimes.set(s.pid, Date.now());
+    }
     const serializeTrackedSessions = (): PersistedTrackedSession[] => {
       return Array.from(pidToTrackedSession.values()).map(s => ({
         pid: s.pid,
         happySessionId: s.happySessionId,
         startedBy: s.startedBy,
         tmuxSessionId: s.tmuxSessionId,
-        startedAt: Date.now(),
+        startedAt: sessionStartTimes.get(s.pid) ?? Date.now(),
       }));
     };
+
+    // Forward declaration — assigned after fileState is available
+    let persistTrackedSessions: () => void = () => {};
 
     // Handle webhook from happy session reporting itself
     const onHappySessionWebhook = (sessionId: string, sessionMetadata: Metadata) => {
@@ -551,6 +558,7 @@ export async function startDaemon(): Promise<void> {
       };
 
       pidToTrackedSession.set(happyProcess.pid, trackedSession);
+      sessionStartTimes.set(happyProcess.pid, Date.now());
       persistTrackedSessions();
 
       happyProcess.on('exit', (code, signal) => {
@@ -681,8 +689,8 @@ export async function startDaemon(): Promise<void> {
     writeDaemonState(fileState);
     logger.debug('[DAEMON RUN] Daemon state written');
 
-    // Persist tracked sessions to disk on every mutation (debounced)
-    const persistTrackedSessions = () => {
+    // Now that fileState is available, assign the real implementation
+    persistTrackedSessions = () => {
       writeDaemonStateDebounced({
         ...fileState,
         state: 'running',

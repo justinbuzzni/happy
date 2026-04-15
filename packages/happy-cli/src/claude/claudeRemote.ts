@@ -123,10 +123,11 @@ export async function claudeRemote(opts: {
         ...opts.mcpServers,
         ...(opts.orchestratorMode ? opts.orchestratorMcpServers : {}),
     };
+    const hasMcpServers = Object.keys(mergedMcpServers).length > 0;
     const sdkOptions: QueryOptions = {
         cwd: opts.path,
         resume: startFrom ?? undefined,
-        mcpServers: Object.keys(mergedMcpServers).length > 0 ? mergedMcpServers : opts.mcpServers,
+        mcpServers: hasMcpServers ? mergedMcpServers : undefined,
         permissionMode: mapToClaudeMode(initial.mode.permissionMode),
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,

@@ -43,7 +43,7 @@ export class LocalToolExecutor implements ToolExecutor {
 
     private validatePath(filePath: string): string {
         const resolved = resolve(this.cwd, filePath);
-        if (!resolved.startsWith(this.cwd)) {
+        if (resolved !== this.cwd && !resolved.startsWith(this.cwd + '/')) {
             throw new Error(`Path ${filePath} is outside workspace`);
         }
         return resolved;

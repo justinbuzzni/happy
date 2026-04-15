@@ -10,20 +10,26 @@ export async function persistSessionEvent(params: {
 }) {
     const { sessionId, eventType, content } = params;
 
-    const seq = await allocateSessionEventSeq(sessionId);
+    const event = await db.$transaction(async (tx) => {
+        const session = await tx.session.update({
+            where: { id: sessionId },
+            select: { eventSeq: true },
+            data: { eventSeq: { increment: 1 } },
+        });
 
-    const event = await db.sessionEvent.create({
-        data: {
-            sessionId,
-            eventType,
-            seq,
-            content: { t: 'encrypted', c: content },
-        },
-        select: {
-            id: true,
-            seq: true,
-            createdAt: true,
-        },
+        return tx.sessionEvent.create({
+            data: {
+                sessionId,
+                eventType,
+                seq: session.eventSeq,
+                content: { t: 'encrypted', c: content },
+            },
+            select: {
+                id: true,
+                seq: true,
+                createdAt: true,
+            },
+        });
     });
 
     return event;

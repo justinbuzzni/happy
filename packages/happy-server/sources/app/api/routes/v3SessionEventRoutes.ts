@@ -1,10 +1,13 @@
 import { persistSessionEvent } from "@/app/events/persistSessionEvent";
+import { SESSION_EVENT_TYPES, type SessionEventType } from "@/app/events/sessionEventTypes";
 import { db } from "@/storage/db";
 import { z } from "zod";
 import { type Fastify } from "../types";
 
+const validEventTypes = Object.values(SESSION_EVENT_TYPES) as [string, ...string[]];
+
 const sendEventBodySchema = z.object({
-    eventType: z.string().min(1),
+    eventType: z.enum(validEventTypes),
     content: z.string(),
 });
 
@@ -122,7 +125,7 @@ export function v3SessionEventRoutes(app: Fastify) {
 
         const event = await persistSessionEvent({
             sessionId,
-            eventType: eventType as any,
+            eventType: eventType as SessionEventType,
             content,
         });
 

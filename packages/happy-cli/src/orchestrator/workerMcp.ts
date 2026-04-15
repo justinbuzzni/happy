@@ -66,7 +66,7 @@ export function createWorkerMcpServer(options: WorkerMcpOptions): McpServer {
 
         logger.debug(`[WorkerMCP] Spawning ${args.role} worker ${taskId}: ${args.task.slice(0, 100)}`);
 
-        options.runWorker(task).then((result) => {
+        Promise.resolve().then(() => options.runWorker(task)).then((result) => {
             task.status = 'complete';
             task.result = result;
             task.completedAt = Date.now();
@@ -78,6 +78,9 @@ export function createWorkerMcpServer(options: WorkerMcpOptions): McpServer {
             task.completedAt = Date.now();
             activeWorkerCount--;
             logger.debug(`[WorkerMCP] Worker ${taskId} failed: ${task.error}`);
+        }).finally(() => {
+            // Clean up completed tasks after 5 minutes to prevent unbounded memory growth
+            setTimeout(() => { tasks.delete(taskId); }, 5 * 60 * 1000);
         });
 
         return {
