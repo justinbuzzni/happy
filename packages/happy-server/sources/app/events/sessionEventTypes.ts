@@ -6,6 +6,8 @@ export const SESSION_EVENT_TYPES = {
     AGENT_MESSAGE: 'agent-message',
     USAGE_REPORT: 'usage-report',
     ERROR: 'error',
+    CHECKPOINT_SNAPSHOT: 'checkpoint-snapshot',
+    CHECKPOINT_REWIND: 'checkpoint-rewind',
 } as const;
 
 export type SessionEventType = typeof SESSION_EVENT_TYPES[keyof typeof SESSION_EVENT_TYPES];
