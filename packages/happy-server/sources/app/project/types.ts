@@ -44,7 +44,10 @@ export type ProjectError =
     | 'member-not-found'
     | 'cannot-delete-default'
     | 'workspace-not-found'
-    | 'branch-exists';
+    | 'branch-exists'
+    | 'merge-request-not-found'
+    | 'merge-request-not-open'
+    | 'merge-conflict';
 
 export type Result<T> =
     | { ok: true; value: T }

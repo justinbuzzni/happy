@@ -26,6 +26,7 @@ import { v3SessionEventRoutes } from "./routes/v3SessionEventRoutes";
 import { projectRoutes } from "./routes/projectRoutes";
 import { projectMemberRoutes } from "./routes/projectMemberRoutes";
 import { workspaceRoutes } from "./routes/workspaceRoutes";
+import { mergeRequestRoutes } from "./routes/mergeRequestRoutes";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
@@ -98,6 +99,7 @@ export async function startApi() {
     projectRoutes(typed);
     projectMemberRoutes(typed);
     workspaceRoutes(typed);
+    mergeRequestRoutes(typed);
 
     // Start HTTP
     const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3005;

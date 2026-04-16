@@ -56,6 +56,8 @@ model Account {
     ProjectMember       ProjectMember[]
     ProjectMemberInviter ProjectMember[]  @relation("ProjectMemberInviter")
     Workspace           Workspace[]
+    MergeRequest        MergeRequest[]
+    MergeRequestComment MergeRequestComment[]
 }
 
 model TerminalAuthRequest {
@@ -402,6 +404,7 @@ model Project {
     giteaRepo            String?
     members              ProjectMember[]
     workspaces           Workspace[]
+    mergeRequests        MergeRequest[]
 
     @@index([accountId])
 }
@@ -436,7 +439,43 @@ model Workspace {
     createdAt   DateTime @default(now())
     updatedAt   DateTime @updatedAt
 
+    mergeRequests MergeRequest[]
+
     @@unique([projectId, branchName])
     @@index([projectId])
     @@index([accountId])
+}
+
+model MergeRequest {
+    id            String                @id @default(cuid())
+    title         String
+    description   String                @default("")
+    projectId     String
+    project       Project               @relation(fields: [projectId], references: [id], onDelete: Cascade)
+    workspaceId   String
+    workspace     Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+    authorId      String
+    author        Account               @relation(fields: [authorId], references: [id])
+    status        String                @default("open")
+    createdAt     DateTime              @default(now())
+    updatedAt     DateTime              @updatedAt
+    comments      MergeRequestComment[]
+
+    @@index([projectId])
+    @@index([workspaceId])
+    @@index([authorId])
+}
+
+model MergeRequestComment {
+    id              String       @id @default(cuid())
+    mergeRequestId  String
+    mergeRequest    MergeRequest @relation(fields: [mergeRequestId], references: [id], onDelete: Cascade)
+    authorId        String
+    author          Account      @relation(fields: [authorId], references: [id])
+    body            String
+    filePath        String?
+    lineNumber      Int?
+    createdAt       DateTime     @default(now())
+
+    @@index([mergeRequestId])
 }
