@@ -11,11 +11,20 @@ const sendEventBodySchema = z.object({
     content: z.string(),
 });
 
-const getEventsQuerySchema = z.object({
-    after_seq: z.coerce.number().int().min(0).default(0),
-    limit: z.coerce.number().int().min(1).max(500).default(100),
-    type: z.string().optional(),
-});
+export const getEventsQuerySchema = z
+    .object({
+        after_seq: z.coerce.number().int().min(0).default(0),
+        before_seq: z.coerce.number().int().min(1).optional(),
+        limit: z.coerce.number().int().min(1).max(500).default(100),
+        type: z.string().optional(),
+        order: z.enum(['asc', 'desc']).default('asc'),
+    })
+    .refine(
+        // `after_seq` defaults to 0, so treat "explicitly > 0 AND before_seq set" as the ambiguous case.
+        // Sending both cursors at once leaves the filter direction undefined; callers must pick one.
+        (q) => !(q.after_seq > 0 && q.before_seq !== undefined),
+        { message: 'after_seq and before_seq cannot be combined' },
+    );
 
 interface SelectedEvent {
     id: string;
@@ -49,7 +58,7 @@ export function v3SessionEventRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = request.userId;
         const { sessionId } = request.params;
-        const { after_seq, limit, type } = request.query;
+        const { after_seq, before_seq, limit, type, order } = request.query;
 
         const session = await db.session.findFirst({
             where: {
@@ -65,11 +74,11 @@ export function v3SessionEventRoutes(app: Fastify) {
 
         const where: {
             sessionId: string;
-            seq: { gt: number };
+            seq: { gt: number } | { lt: number };
             eventType?: string;
         } = {
             sessionId,
-            seq: { gt: after_seq },
+            seq: before_seq !== undefined ? { lt: before_seq } : { gt: after_seq },
         };
         if (type) {
             where.eventType = type;
@@ -77,7 +86,7 @@ export function v3SessionEventRoutes(app: Fastify) {
 
         const events = await db.sessionEvent.findMany({
             where,
-            orderBy: { seq: 'asc' },
+            orderBy: { seq: order },
             take: limit + 1,
             select: {
                 id: true,
