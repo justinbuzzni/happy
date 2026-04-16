@@ -1,4 +1,4 @@
-import { FeedBody } from "./types";
+import { FeedBody, FeedBodySchema } from "./types";
 import { afterTx, Tx } from "@/storage/inTx";
 import { allocateUserSeq } from "@/storage/seq";
 import { eventRouter, buildNewFeedPostUpdate } from "@/app/events/eventRouter";
@@ -8,6 +8,7 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
  * Add a feed post to a target user (not the caller).
  * Used for collaboration notifications where one user's action notifies others.
  * Skips if targetUserId equals excludeUserId (typically the actor).
+ * Validates the body against FeedBodySchema to guard the DB invariant.
  */
 export async function feedPostToUser(
     tx: Tx,
@@ -18,6 +19,8 @@ export async function feedPostToUser(
     if (options?.excludeUserId && targetUserId === options.excludeUserId) {
         return;
     }
+
+    const validated = FeedBodySchema.parse(body);
 
     if (options?.repeatKey) {
         await tx.userFeedItem.deleteMany({
@@ -36,7 +39,7 @@ export async function feedPostToUser(
             counter: user.feedSeq,
             userId: targetUserId,
             repeatKey: options?.repeatKey ?? null,
-            body: body
+            body: validated
         }
     });
 
