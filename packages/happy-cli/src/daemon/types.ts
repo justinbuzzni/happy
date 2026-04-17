@@ -19,4 +19,11 @@ export interface TrackedSession {
   message?: string;
   /** tmux session identifier (format: session:window) */
   tmuxSessionId?: string;
+  /**
+   * Absolute path to a tmp HAPPY_HOME_DIR staged for this session's child
+   * process. Present only when the spawn request carried per-user Happy
+   * credentials. The daemon removes this directory when the child exits or
+   * sweeps it on next startup if cleanup was missed.
+   */
+  userHomeDir?: string;
 }

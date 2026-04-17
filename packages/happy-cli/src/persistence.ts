@@ -72,6 +72,8 @@ export interface PersistedTrackedSession {
   startedBy: string;
   tmuxSessionId?: string;
   startedAt: number;
+  /** Tmp HAPPY_HOME_DIR staged for this session, if any. Cleaned on exit. */
+  userHomeDir?: string;
 }
 
 /**
