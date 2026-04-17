@@ -18,6 +18,7 @@ import { writeDaemonState, writeDaemonStateDebounced, flushDaemonState, DaemonLo
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
 import { createPortRegistry } from './portRegistry';
+import { stageUserCredentials } from './stageUserCredentials';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -310,6 +311,16 @@ export async function startDaemon(): Promise<void> {
           } else { // Assuming claude
             authEnv.CLAUDE_CODE_OAUTH_TOKEN = options.token;
           }
+        }
+
+        // When the requesting user's Happy credentials are provided, write them
+        // to a per-spawn access.key so the child CLI registers its session under
+        // the user's account rather than inheriting the daemon's credentials
+        // from ~/.happy-dev/access.key.
+        if (options.happyToken && options.happySecret) {
+          const { homeDir } = await stageUserCredentials(options.happyToken, options.happySecret);
+          authEnv.HAPPY_HOME_DIR = homeDir;
+          logger.debug(`[DAEMON RUN] User credentials staged at ${homeDir}/access.key`);
         }
 
         let extraEnv = {
