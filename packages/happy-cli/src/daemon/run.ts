@@ -17,6 +17,7 @@ import { writeDaemonState, writeDaemonStateDebounced, flushDaemonState, DaemonLo
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
+import { createPortRegistry } from './portRegistry';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
@@ -667,13 +668,17 @@ export async function startDaemon(): Promise<void> {
       persistTrackedSessions();
     };
 
+    // Per-project port registry (30000-40000), persisted at configuration.portRegistryFile
+    const portRegistry = createPortRegistry({ filePath: configuration.portRegistryFile });
+
     // Start control server
     const { port: controlPort, stop: stopControlServer } = await startDaemonControlServer({
       getChildren: getCurrentChildren,
       stopSession,
       spawnSession,
       requestShutdown: () => requestShutdown('happy-cli'),
-      onHappySessionWebhook
+      onHappySessionWebhook,
+      portRegistry
     });
 
     // Write initial daemon state (no lock needed for state file)

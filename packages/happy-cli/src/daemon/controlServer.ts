@@ -10,19 +10,22 @@ import { logger } from '@/ui/logger';
 import { Metadata } from '@/api/types';
 import { TrackedSession } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
+import { PortRegistry } from './portRegistry';
 
 export function startDaemonControlServer({
   getChildren,
   stopSession,
   spawnSession,
   requestShutdown,
-  onHappySessionWebhook
+  onHappySessionWebhook,
+  portRegistry
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string) => boolean;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
   requestShutdown: () => void;
   onHappySessionWebhook: (sessionId: string, metadata: Metadata) => void;
+  portRegistry: PortRegistry;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
   return new Promise((resolve) => {
     const app = fastify({
@@ -168,6 +171,79 @@ export function startDaemonControlServer({
             error: result.errorMessage
           };
       }
+    });
+
+    // Allocate a port for a project (returns existing sticky port or a fresh one)
+    typed.post('/allocate-port', {
+      schema: {
+        body: z.object({
+          projectId: z.string().min(1)
+        }),
+        response: {
+          200: z.object({
+            port: z.number(),
+            reused: z.boolean()
+          }),
+          503: z.object({
+            error: z.string()
+          })
+        }
+      }
+    }, async (request, reply) => {
+      const { projectId } = request.body;
+      try {
+        const result = await portRegistry.allocate(projectId);
+        logger.debug(`[CONTROL SERVER] Allocated port ${result.port} for project ${projectId} (reused=${result.reused})`);
+        return result;
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        logger.debug(`[CONTROL SERVER] Port allocation failed for ${projectId}: ${message}`);
+        reply.code(503);
+        return { error: message };
+      }
+    });
+
+    // Release a project's port binding (e.g., on project deletion)
+    typed.post('/release-port', {
+      schema: {
+        body: z.object({
+          projectId: z.string().min(1)
+        }),
+        response: {
+          200: z.object({
+            released: z.boolean()
+          })
+        }
+      }
+    }, async (request) => {
+      const { projectId } = request.body;
+      const released = await portRegistry.release(projectId);
+      logger.debug(`[CONTROL SERVER] Release port for ${projectId}: released=${released}`);
+      return { released };
+    });
+
+    // Read full port registry (debugging / inspection)
+    typed.get('/port-registry', {
+      schema: {
+        response: {
+          200: z.object({
+            entries: z.array(z.object({
+              projectId: z.string(),
+              port: z.number(),
+              allocatedAt: z.number()
+            }))
+          })
+        }
+      }
+    }, async () => {
+      const data = await portRegistry.readAll();
+      return {
+        entries: Object.entries(data).map(([projectId, entry]) => ({
+          projectId,
+          port: entry.port,
+          allocatedAt: entry.allocatedAt
+        }))
+      };
     });
 
     // Stop daemon
