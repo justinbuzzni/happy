@@ -707,9 +707,10 @@ export async function startDaemon(): Promise<void> {
         const homeDir = tracked.userHomeDir;
         // Small delay lets the child flush any final writes before we unlink.
         setTimeout(() => {
-          unstageUserCredentials(homeDir).catch((err) => {
-            logger.debug(`[DAEMON RUN] Failed to unstage ${homeDir}: ${err instanceof Error ? err.message : String(err)}`);
-          });
+          unstageUserCredentials(homeDir).then(
+            () => logger.debug(`[DAEMON RUN] Unstaged user home dir ${homeDir}`),
+            (err) => logger.debug(`[DAEMON RUN] Failed to unstage ${homeDir}: ${err instanceof Error ? err.message : String(err)}`),
+          );
         }, 100);
       }
     };
