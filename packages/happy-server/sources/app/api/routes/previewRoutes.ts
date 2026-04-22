@@ -1,0 +1,239 @@
+/**
+ * Remote preview relay routes.
+ *
+ * Flow:
+ *   Browser iframe
+ *     ─GET/POST→ /v1/preview/:machineId/:port/*?ptoken=…
+ *       (this route)
+ *     ─rpc-request→ daemon socket (emitWithAck 'proxy-http')
+ *       (daemon relays to 127.0.0.1:{port})
+ *     ← ProxyResponse ({ type: 'success'|'error', … })
+ *   Response body (+rewriteHtml for text/html) → browser
+ *
+ * Authentication is intentionally split:
+ * - `POST /v1/preview-token` uses the normal Bearer auth + DB check to mint a
+ *   short-lived HMAC token bound to (userId, machineId, port).
+ * - The preview route itself accepts only the ptoken (iframe src cannot carry
+ *   an Authorization header).
+ */
+
+import { Socket } from "socket.io";
+import { z } from "zod";
+import { db } from "@/storage/db";
+import { log } from "@/utils/log";
+import { eventRouter } from "@/app/events/eventRouter";
+import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
+import { rewriteHtml, rewriteJsCss } from "@/modules/preview/rewriteHtml";
+import { type Fastify } from "../types";
+
+interface ProxySuccess {
+    type: 'success';
+    status: number;
+    headers: Record<string, string>;
+    bodyB64: string;
+    truncated: boolean;
+}
+
+interface ProxyError {
+    type: 'error';
+    code: string;
+    message: string;
+}
+
+type ProxyRpcResponse = ProxySuccess | ProxyError;
+
+const RPC_TIMEOUT_MS = 35_000;
+
+const ALL_METHODS: Array<'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS'> =
+    ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
+
+function findMachineSocket(userId: string, machineId: string): Socket | null {
+    const connections = eventRouter.getConnections(userId);
+    if (!connections) return null;
+    for (const c of connections) {
+        if (c.connectionType === 'machine-scoped' && c.machineId === machineId) {
+            return c.socket;
+        }
+    }
+    return null;
+}
+
+function filterForwardedHeaders(raw: Record<string, string | string[] | undefined>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw)) {
+        if (value === undefined) continue;
+        const lower = key.toLowerCase();
+        // Strip hop-by-hop + things only meaningful to happy-server itself.
+        if (
+            lower === 'host' ||
+            lower === 'connection' ||
+            lower === 'keep-alive' ||
+            lower === 'upgrade' ||
+            lower === 'proxy-authenticate' ||
+            lower === 'proxy-authorization' ||
+            lower === 'te' ||
+            lower === 'trailer' ||
+            lower === 'transfer-encoding' ||
+            lower === 'authorization' ||
+            lower === 'cookie'
+        ) continue;
+        out[key] = Array.isArray(value) ? value.join(', ') : value;
+    }
+    return out;
+}
+
+function stripResponseHeaders(headers: Record<string, string>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(headers)) {
+        const lower = key.toLowerCase();
+        // Drop headers that don't survive rewriting (Content-Length changes)
+        // and frame-ancestor directives that would block iframe embedding.
+        if (lower === 'content-length' || lower === 'content-encoding') continue;
+        if (lower === 'x-frame-options') continue;
+        out[key] = value;
+    }
+    return out;
+}
+
+export function previewRoutes(app: Fastify) {
+    // Mint a short-lived ptoken that binds (userId, machineId, port) under HMAC.
+    app.post('/v1/preview-token', {
+        preHandler: app.authenticate,
+        schema: {
+            body: z.object({
+                machineId: z.string().min(1),
+                port: z.number().int().min(1).max(65535),
+            }),
+            response: {
+                200: z.object({
+                    token: z.string(),
+                    expiresAt: z.number(),
+                }),
+                403: z.object({ error: z.string() }),
+                404: z.object({ error: z.string() }),
+            },
+        },
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const { machineId, port } = request.body;
+
+        const machine = await db.machine.findFirst({ where: { id: machineId, accountId: userId } });
+        if (!machine) {
+            return reply.code(404).send({ error: 'Machine not found' });
+        }
+
+        const signed = signPreviewToken({ userId, machineId, port });
+        log({ module: 'preview', userId, machineId, port }, 'Minted preview token');
+        return reply.send({ token: signed.token, expiresAt: signed.expiresAt });
+    });
+
+    // Preview relay route lives inside its own encapsulation scope so we can
+    // register a raw-buffer content-type parser without affecting other JSON
+    // routes on the same app.
+    app.register(async (scope) => {
+        scope.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => {
+            done(null, body);
+        });
+
+        scope.route({
+            method: ALL_METHODS,
+            url: '/v1/preview/:machineId/:port/*',
+            handler: async (request, reply) => {
+                const params = request.params as { machineId: string; port: string; '*'?: string };
+                const query = request.query as { ptoken?: string };
+
+                // Verify ptoken + cross-check against URL params.
+                const token = query.ptoken;
+                if (!token) {
+                    return reply.code(401).send({ error: 'Missing ptoken' });
+                }
+                const claims = verifyPreviewToken(token);
+                if (!claims) {
+                    return reply.code(401).send({ error: 'Invalid or expired ptoken' });
+                }
+                const portNum = Number.parseInt(params.port, 10);
+                if (!Number.isInteger(portNum)) {
+                    return reply.code(400).send({ error: 'Invalid port' });
+                }
+                if (claims.machineId !== params.machineId || claims.port !== portNum) {
+                    return reply.code(403).send({ error: 'Token does not match requested machine/port' });
+                }
+
+                // Find the machine socket.
+                const machineSocket = findMachineSocket(claims.userId, params.machineId);
+                if (!machineSocket) {
+                    return reply.code(502).send({ error: 'Machine offline' });
+                }
+
+                // Build the upstream path (everything after `:port/`) + query string
+                // excluding the ptoken we added.
+                const subPath = params['*'] ?? '';
+                const upstreamQuery = new URLSearchParams();
+                for (const [k, v] of Object.entries(request.query as Record<string, string>)) {
+                    if (k === 'ptoken') continue;
+                    upstreamQuery.append(k, v);
+                }
+                const qs = upstreamQuery.toString();
+                const upstreamPath = `/${subPath}${qs ? `?${qs}` : ''}`;
+
+                const bodyBuf: Buffer | undefined = request.body as Buffer | undefined;
+                const bodyB64 = bodyBuf && bodyBuf.length > 0 ? bodyBuf.toString('base64') : null;
+
+                const forwardHeaders = filterForwardedHeaders(request.headers);
+
+                // Relay via RPC.
+                let rpcResponse: ProxyRpcResponse;
+                try {
+                    const raw = await machineSocket
+                        .timeout(RPC_TIMEOUT_MS)
+                        .emitWithAck('rpc-request', {
+                            method: `${params.machineId}:proxy-http`,
+                            params: {
+                                port: portNum,
+                                method: request.method,
+                                path: upstreamPath,
+                                headers: forwardHeaders,
+                                bodyB64,
+                            },
+                        });
+                    rpcResponse = raw as ProxyRpcResponse;
+                } catch (err) {
+                    log({ module: 'preview', level: 'error' }, `RPC call failed: ${(err as Error).message}`);
+                    return reply.code(504).send({ error: 'Upstream relay timeout' });
+                }
+
+                if (rpcResponse.type === 'error') {
+                    const status =
+                        rpcResponse.code === 'INVALID_PORT' || rpcResponse.code === 'INVALID_PATH' ? 400 :
+                        rpcResponse.code === 'TIMEOUT' ? 504 : 502;
+                    return reply.code(status).send({ code: rpcResponse.code, error: rpcResponse.message });
+                }
+
+                // Successful proxy response — rewrite HTML/JS/CSS if applicable.
+                const prefix = `/v1/preview/${params.machineId}/${portNum}`;
+                const contentType = (rpcResponse.headers['content-type'] ?? '').toLowerCase();
+                let responseBody: Buffer = Buffer.from(rpcResponse.bodyB64, 'base64');
+
+                if (contentType.includes('text/html')) {
+                    responseBody = Buffer.from(rewriteHtml(responseBody.toString('utf-8'), prefix), 'utf-8');
+                } else if (
+                    contentType.includes('javascript') ||
+                    contentType.includes('typescript') ||
+                    contentType.includes('text/css')
+                ) {
+                    responseBody = Buffer.from(rewriteJsCss(responseBody.toString('utf-8'), prefix), 'utf-8');
+                }
+
+                const outHeaders = stripResponseHeaders(rpcResponse.headers);
+                if (rpcResponse.truncated) {
+                    outHeaders['X-Preview-Truncated'] = '1';
+                }
+                // Always send fresh Content-Length because the body may have been rewritten.
+                outHeaders['Content-Length'] = String(responseBody.length);
+
+                reply.raw.writeHead(rpcResponse.status, outHeaders);
+                reply.raw.end(responseBody);
+            },
+        });
+    });
+}

@@ -27,6 +27,7 @@ import { projectRoutes } from "./routes/projectRoutes";
 import { projectMemberRoutes } from "./routes/projectMemberRoutes";
 import { workspaceRoutes } from "./routes/workspaceRoutes";
 import { mergeRequestRoutes } from "./routes/mergeRequestRoutes";
+import { previewRoutes } from "./routes/previewRoutes";
 import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
@@ -100,6 +101,7 @@ export async function startApi() {
     projectMemberRoutes(typed);
     workspaceRoutes(typed);
     mergeRequestRoutes(typed);
+    previewRoutes(typed);
 
     // Start HTTP
     const port = process.env.PORT ? parseInt(process.env.PORT, 10) : 3005;
