@@ -15,6 +15,8 @@ import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
 import type { PortRegistry } from '@/daemon/portRegistry';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
+import { startServerProcess, StartServerError } from '@/daemon/startServer';
+import type { ChildProcess } from 'node:child_process';
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -200,6 +202,43 @@ export class ApiMachineClient {
             const released = await portRegistry.release(projectId);
             logger.debug(`[API MACHINE] release-port ${projectId} -> released=${released}`);
             return { released };
+        });
+
+        // Register dev-server spawn handler — the web-ui hits this when
+        // Phase 12 "direct server start" runs on a remote-machine session.
+        // Returns an explicit {type:'success'|'error', ...} envelope so the
+        // caller sees the StartServerError code (CWD_NOT_FOUND, ENOENT,
+        // ...). See specs/remote-server-start/ Phase 3.
+        const spawnedServers = new Map<number, ChildProcess>();
+        this.rpcHandlerManager.registerHandler('start-server', async (params: any) => {
+            const { command, cwd, env } = params || {};
+            if (typeof command !== 'string' || typeof cwd !== 'string') {
+                return { type: 'error', code: 'INVALID_REQUEST', message: 'command and cwd are required' };
+            }
+            try {
+                const result = await startServerProcess(
+                    { command, cwd, env },
+                    {
+                        fastFailDelayMs: 50,
+                        onSpawn: (child) => {
+                            if (child.pid) {
+                                spawnedServers.set(child.pid, child);
+                                child.on('exit', () => spawnedServers.delete(child.pid!));
+                            }
+                        },
+                    },
+                );
+                logger.debug(`[API MACHINE] start-server spawned pid=${result.pid} cwd=${cwd}`);
+                return { type: 'success', pid: result.pid };
+            } catch (e) {
+                if (e instanceof StartServerError) {
+                    logger.debug(`[API MACHINE] start-server failed: ${e.code} ${e.message}`);
+                    return { type: 'error', code: e.code, message: e.message };
+                }
+                const message = e instanceof Error ? e.message : String(e);
+                logger.debug(`[API MACHINE] start-server internal error: ${message}`);
+                return { type: 'error', code: 'INTERNAL', message };
+            }
         });
 
         // NOTE: proxy-http is intentionally wired as a plain socket event

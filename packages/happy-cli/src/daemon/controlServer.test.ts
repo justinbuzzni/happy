@@ -273,3 +273,115 @@ describe('controlServer POST /proxy-http', () => {
     expect(json.code === 'INVALID_PORT' || res.status === 400).toBe(true)
   })
 })
+
+describe('controlServer POST /start-server', () => {
+  let dir: string
+  let baseUrl: string
+  let stopServer: () => Promise<void>
+  const spawnedPids: number[] = []
+
+  const kill = (pid: number) => {
+    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
+    const registry = createPortRegistry({
+      filePath: path.join(dir, 'port-registry.json'),
+      portMin: 30000,
+      portMax: 30010,
+      isPortBindable: async () => true,
+    })
+    const { port, stop } = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: () => false,
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      portRegistry: registry,
+    })
+    baseUrl = `http://127.0.0.1:${port}`
+    stopServer = stop
+  })
+
+  afterEach(async () => {
+    for (const pid of spawnedPids) kill(pid)
+    spawnedPids.length = 0
+    await stopServer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const post = async (body: unknown) =>
+    fetch(`${baseUrl}/start-server`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  const writeSleepScript = (ms: number): string => {
+    const p = path.join(dir, 'sleep.js')
+    require('node:fs').writeFileSync(p, `setTimeout(() => process.exit(0), ${ms})`)
+    return p
+  }
+
+  it('spawns and returns 200 with the pid', async () => {
+    const script = writeSleepScript(1500)
+    const res = await post({ command: `node ${script}`, cwd: dir })
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { success: boolean; pid: number }
+    expect(json.success).toBe(true)
+    expect(Number.isInteger(json.pid)).toBe(true)
+    expect(() => process.kill(json.pid, 0)).not.toThrow()
+    spawnedPids.push(json.pid)
+  })
+
+  it('returns 400 CWD_NOT_FOUND for a missing working directory', async () => {
+    const res = await post({ command: 'node foo.js', cwd: '/nope/xyz/123' })
+    expect(res.status).toBe(400)
+    const json = (await res.json()) as { code: string }
+    expect(json.code).toBe('CWD_NOT_FOUND')
+  })
+
+  it('returns 400 INVALID_COMMAND for a shell-metachar command', async () => {
+    const res = await post({ command: 'node a.js && echo hi', cwd: dir })
+    expect(res.status).toBe(400)
+    const json = (await res.json()) as { code: string }
+    expect(json.code).toBe('INVALID_COMMAND')
+  })
+
+  it('returns 500 EXEC_NOT_FOUND when the binary is not on PATH', async () => {
+    const res = await post({ command: 'nonexistent-binary-xyz-123', cwd: dir })
+    expect(res.status).toBe(500)
+    const json = (await res.json()) as { code: string }
+    expect(json.code).toBe('EXEC_NOT_FOUND')
+  })
+
+  it('injects env vars into the spawned process', async () => {
+    const outPath = path.join(dir, 'out.txt')
+    const scriptPath = path.join(dir, 'env-probe.js')
+    require('node:fs').writeFileSync(scriptPath, `
+const fs = require('fs')
+fs.writeFileSync(process.env.OUT, process.env.TEST_VAR || '')
+setTimeout(() => process.exit(0), 1500)
+`)
+    const res = await post({
+      command: `node ${scriptPath}`,
+      cwd: dir,
+      env: { OUT: outPath, TEST_VAR: 'elastic_id=1' },
+    })
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { pid: number }
+    spawnedPids.push(json.pid)
+    // Allow the child to fsync before we assert.
+    await new Promise((r) => setTimeout(r, 150))
+    expect(require('node:fs').existsSync(outPath)).toBe(true)
+    expect(require('node:fs').readFileSync(outPath, 'utf-8')).toBe('elastic_id=1')
+  })
+
+  it('rejects 400 on missing command/cwd fields', async () => {
+    const r1 = await post({ cwd: dir })
+    expect(r1.status).toBe(400)
+    const r2 = await post({ command: 'node foo.js' })
+    expect(r2.status).toBe(400)
+  })
+})

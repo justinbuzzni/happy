@@ -12,6 +12,8 @@ import { TrackedSession } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import { PortRegistry } from './portRegistry';
 import { proxyHttp, PreviewProxyError } from './previewProxy';
+import { startServerProcess, StartServerError } from './startServer';
+import type { ChildProcess } from 'node:child_process';
 
 export function startDaemonControlServer({
   getChildren,
@@ -247,6 +249,63 @@ export function startDaemonControlServer({
           allocatedAt: entry.allocatedAt
         }))
       };
+    });
+
+    // Spawn a dev server process on this machine on behalf of the web-ui
+    // `/api/start-server` route. Lives next to /proxy-http because they
+    // share the "remote-session management plane" — see
+    // specs/remote-server-start/ Phase 3.
+    const spawnedServers = new Map<number, ChildProcess>();
+    typed.post('/start-server', {
+      schema: {
+        body: z.object({
+          command: z.string().min(1),
+          cwd: z.string().min(1),
+          env: z.record(z.string(), z.string()).optional()
+        }),
+        response: {
+          200: z.object({
+            success: z.literal(true),
+            pid: z.number()
+          }),
+          400: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          500: z.object({
+            code: z.string(),
+            error: z.string()
+          })
+        }
+      }
+    }, async (request, reply) => {
+      try {
+        const result = await startServerProcess(request.body, {
+          // Give Node's ChildProcess 'error' event (ENOENT) time to fire
+          // before we claim success. Matches the web-ui handler's
+          // setImmediate+error-once pattern.
+          fastFailDelayMs: 50,
+          onSpawn: (child) => {
+            if (child.pid) {
+              spawnedServers.set(child.pid, child);
+              child.on('exit', () => spawnedServers.delete(child.pid!));
+            }
+          }
+        });
+        logger.debug(`[CONTROL SERVER] start-server spawned pid=${result.pid} cwd=${request.body.cwd}`);
+        return { success: true as const, pid: result.pid };
+      } catch (e) {
+        if (e instanceof StartServerError) {
+          logger.debug(`[CONTROL SERVER] start-server failed: ${e.code} ${e.message}`);
+          if (e.code === 'CWD_NOT_FOUND' || e.code === 'INVALID_COMMAND') {
+            reply.code(400);
+          } else {
+            reply.code(500);
+          }
+          return { code: e.code, error: e.message };
+        }
+        throw e;
+      }
     });
 
     // Relay an HTTP request to a local dev server on 127.0.0.1:{port}
