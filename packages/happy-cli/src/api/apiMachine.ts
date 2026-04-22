@@ -14,6 +14,7 @@ import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
 import type { PortRegistry } from '@/daemon/portRegistry';
+import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -189,6 +190,27 @@ export class ApiMachineClient {
             const released = await portRegistry.release(projectId);
             logger.debug(`[API MACHINE] release-port ${projectId} -> released=${released}`);
             return { released };
+        });
+
+        // Register HTTP proxy handler (relay browser request → local dev server)
+        this.rpcHandlerManager.registerHandler('proxy-http', async (params: any) => {
+            try {
+                const result = await proxyHttp({
+                    port: params?.port,
+                    method: params?.method,
+                    path: params?.path,
+                    headers: params?.headers ?? {},
+                    bodyB64: params?.bodyB64 ?? null,
+                });
+                logger.debug(`[API MACHINE] proxy-http ${params?.method} ${params?.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''}`);
+                return { type: 'success', ...result };
+            } catch (e) {
+                if (e instanceof PreviewProxyError) {
+                    logger.debug(`[API MACHINE] proxy-http failed: ${e.code} ${e.message}`);
+                    return { type: 'error', code: e.code, message: e.message };
+                }
+                throw e;
+            }
         });
     }
 

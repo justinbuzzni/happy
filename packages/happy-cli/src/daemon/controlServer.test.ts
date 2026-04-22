@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import http, { IncomingMessage, ServerResponse } from 'node:http'
+import { AddressInfo } from 'node:net'
 import { createPortRegistry } from './portRegistry'
 import { startDaemonControlServer } from './controlServer'
 
@@ -161,5 +163,113 @@ describe('controlServer port allocation — range exhaustion', () => {
     expect(res.status).toBe(503)
     const body = (await res.json()) as { error?: string }
     expect(body.error).toMatch(/No available port/)
+  })
+})
+
+describe('controlServer POST /proxy-http', () => {
+  let dir: string
+  let baseUrl: string
+  let stopServer: () => Promise<void>
+  let upstream: { port: number; stop: () => Promise<void> } | null = null
+
+  const startUpstream = async (handler: (req: IncomingMessage, res: ServerResponse) => void) => {
+    const srv = http.createServer(handler)
+    await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', () => resolve()))
+    const port = (srv.address() as AddressInfo).port
+    upstream = { port, stop: () => new Promise<void>((r) => srv.close(() => r())) }
+    return port
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
+    const registry = createPortRegistry({
+      filePath: path.join(dir, 'port-registry.json'),
+      portMin: 30000,
+      portMax: 30010,
+      isPortBindable: async () => true,
+    })
+    const { port, stop } = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: () => false,
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      portRegistry: registry,
+    })
+    baseUrl = `http://127.0.0.1:${port}`
+    stopServer = stop
+  })
+
+  afterEach(async () => {
+    await stopServer()
+    if (upstream) {
+      await upstream.stop()
+      upstream = null
+    }
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const proxy = async (body: unknown) =>
+    fetch(`${baseUrl}/proxy-http`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  it('relays a GET and returns the upstream status + base64 body', async () => {
+    const port = await startUpstream((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain' })
+      res.end('hello remote')
+    })
+    const res = await proxy({ port, method: 'GET', path: '/', headers: {}, bodyB64: null })
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { status: number; bodyB64: string; truncated: boolean }
+    expect(json.status).toBe(200)
+    expect(Buffer.from(json.bodyB64, 'base64').toString()).toBe('hello remote')
+    expect(json.truncated).toBe(false)
+  })
+
+  it('forwards a POST body and surfaces upstream response', async () => {
+    const port = await startUpstream((req, res) => {
+      let data = ''
+      req.on('data', (c) => { data += c.toString() })
+      req.on('end', () => {
+        res.writeHead(201)
+        res.end(`echo:${data}`)
+      })
+    })
+    const res = await proxy({
+      port, method: 'POST', path: '/echo',
+      headers: { 'Content-Type': 'text/plain' },
+      bodyB64: Buffer.from('ping').toString('base64'),
+    })
+    const json = (await res.json()) as { status: number; bodyB64: string }
+    expect(json.status).toBe(201)
+    expect(Buffer.from(json.bodyB64, 'base64').toString()).toBe('echo:ping')
+  })
+
+  it('returns 502 with CONNECTION_REFUSED when the port has no listener', async () => {
+    // Grab a port and immediately free it
+    const probe = http.createServer()
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', () => r()))
+    const freePort = (probe.address() as AddressInfo).port
+    await new Promise<void>((r) => probe.close(() => r()))
+
+    const res = await proxy({ port: freePort, method: 'GET', path: '/', headers: {}, bodyB64: null })
+    expect(res.status).toBe(502)
+    const json = (await res.json()) as { code: string }
+    expect(json.code).toBe('CONNECTION_REFUSED')
+  })
+
+  it('returns 400 for a non-slash path', async () => {
+    const res = await proxy({ port: 3000, method: 'GET', path: 'bare', headers: {}, bodyB64: null })
+    expect(res.status).toBe(400)
+  })
+
+  it('returns 400 for a port outside the valid range', async () => {
+    const res = await proxy({ port: 42, method: 'GET', path: '/', headers: {}, bodyB64: null })
+    expect(res.status).toBe(400)
+    const json = (await res.json()) as { code?: string }
+    expect(json.code === 'INVALID_PORT' || res.status === 400).toBe(true)
   })
 })

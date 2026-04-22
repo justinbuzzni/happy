@@ -11,6 +11,7 @@ import { Metadata } from '@/api/types';
 import { TrackedSession } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import { PortRegistry } from './portRegistry';
+import { proxyHttp, PreviewProxyError } from './previewProxy';
 
 export function startDaemonControlServer({
   getChildren,
@@ -246,6 +247,58 @@ export function startDaemonControlServer({
           allocatedAt: entry.allocatedAt
         }))
       };
+    });
+
+    // Relay an HTTP request to a local dev server on 127.0.0.1:{port}
+    typed.post('/proxy-http', {
+      schema: {
+        body: z.object({
+          port: z.number().int(),
+          method: z.string().min(1),
+          path: z.string().startsWith('/'),
+          headers: z.record(z.string(), z.string()),
+          bodyB64: z.string().nullable()
+        }),
+        response: {
+          200: z.object({
+            status: z.number(),
+            headers: z.record(z.string(), z.string()),
+            bodyB64: z.string(),
+            truncated: z.boolean()
+          }),
+          400: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          502: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          504: z.object({
+            code: z.string(),
+            error: z.string()
+          })
+        }
+      }
+    }, async (request, reply) => {
+      try {
+        const result = await proxyHttp(request.body);
+        logger.debug(`[CONTROL SERVER] proxy-http ${request.body.method} ${request.body.path} -> ${result.status}${result.truncated ? ' (truncated)' : ''}`);
+        return result;
+      } catch (e) {
+        if (e instanceof PreviewProxyError) {
+          logger.debug(`[CONTROL SERVER] proxy-http failed: ${e.code} ${e.message}`);
+          if (e.code === 'INVALID_PORT' || e.code === 'INVALID_PATH') {
+            reply.code(400);
+          } else if (e.code === 'TIMEOUT') {
+            reply.code(504);
+          } else {
+            reply.code(502);
+          }
+          return { code: e.code, error: e.message };
+        }
+        throw e;
+      }
     });
 
     // Stop daemon
