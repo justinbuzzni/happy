@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import http, { IncomingMessage, ServerResponse } from 'node:http'
 import { AddressInfo } from 'node:net'
+import zlib from 'node:zlib'
 import { proxyHttp, PreviewProxyError } from './previewProxy'
 
 type RequestHandler = (req: IncomingMessage, res: ServerResponse) => void
@@ -304,5 +305,61 @@ describe('proxyHttp', () => {
     await expect(
       proxyHttp({ port: 0, method: 'GET', path: '/', headers: {}, bodyB64: null }),
     ).rejects.toBeInstanceOf(PreviewProxyError)
+  })
+
+  // Regression: browsers default to `Accept-Encoding: gzip, deflate, br`.
+  // If we pass that through to the upstream dev server, the server compresses
+  // the response, and the happy-server preview route (which strips
+  // Content-Encoding and then calls rewriteHtml(bodyUtf8, …)) ends up
+  // UTF-8-decoding gzip bytes and shipping garbage to the iframe. Force
+  // `identity` at the proxy boundary so the end-to-end relay stays plain.
+  // See specs/remote-preview-relay/context.md (Phase 7 — gzip mojibake fix).
+  it('forces Accept-Encoding: identity on the upstream request', async () => {
+    let seenAcceptEncoding: string | string[] | undefined
+    const srv = await startTestServer((req, res) => {
+      seenAcceptEncoding = req.headers['accept-encoding']
+      res.writeHead(200, { 'Content-Type': 'text/plain' })
+      res.end('ok')
+    })
+    stopServer = srv.stop
+
+    await proxyHttp({
+      port: srv.port,
+      method: 'GET',
+      path: '/',
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+      bodyB64: null,
+    })
+
+    expect(seenAcceptEncoding).toBe('identity')
+  })
+
+  it('receives plain (un-gzipped) bodies even when caller requests gzip', async () => {
+    // Simulate a real dev server that respects Accept-Encoding.
+    const srv = await startTestServer((req, res) => {
+      const ae = String(req.headers['accept-encoding'] ?? '')
+      if (ae.includes('gzip')) {
+        const gz = zlib.gzipSync(Buffer.from('<html><body>hello</body></html>'))
+        res.writeHead(200, { 'Content-Type': 'text/html', 'Content-Encoding': 'gzip' })
+        res.end(gz)
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' })
+        res.end('<html><body>hello</body></html>')
+      }
+    })
+    stopServer = srv.stop
+
+    const result = await proxyHttp({
+      port: srv.port,
+      method: 'GET',
+      path: '/',
+      headers: { 'Accept-Encoding': 'gzip, deflate, br' },
+      bodyB64: null,
+    })
+
+    // Body is plain UTF-8 HTML — NOT gzip bytes base64-encoded.
+    expect(fromB64(result.bodyB64)).toBe('<html><body>hello</body></html>')
+    // Upstream didn't compress, so no content-encoding header to forward.
+    expect(result.headers['content-encoding']).toBeUndefined()
   })
 })

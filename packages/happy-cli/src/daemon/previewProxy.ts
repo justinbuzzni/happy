@@ -112,6 +112,18 @@ export function proxyHttp(req: ProxyRequest, opts: ProxyOptions = {}): Promise<P
 
   const bodyBuf = req.bodyB64 ? Buffer.from(req.bodyB64, 'base64') : null
   const requestHeaders = stripHopByHop(req.headers)
+  // Force the upstream to skip compression. The browser's default
+  // `Accept-Encoding: gzip, deflate, br` would otherwise have the dev
+  // server gzip its response, and the happy-server preview route strips
+  // `Content-Encoding` before running HTML/JS rewrites on the body —
+  // turning the iframe into mojibake. Loopback compression buys nothing
+  // here, so identity is strictly an improvement.
+  // Drop any caller-supplied Accept-Encoding (case-insensitive) before
+  // setting identity, otherwise Node sends both values.
+  for (const k of Object.keys(requestHeaders)) {
+    if (k.toLowerCase() === 'accept-encoding') delete requestHeaders[k]
+  }
+  requestHeaders['Accept-Encoding'] = 'identity'
   if (bodyBuf && requestHeaders['content-length'] === undefined) {
     requestHeaders['Content-Length'] = String(bodyBuf.length)
   }
