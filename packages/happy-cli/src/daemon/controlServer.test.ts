@@ -414,3 +414,93 @@ setTimeout(() => process.exit(0), 1500)
     expect(r2.status).toBe(400)
   })
 })
+
+describe('controlServer POST /stop-server', () => {
+  let dir: string
+  let baseUrl: string
+  let stopServer: () => Promise<void>
+  const spawnedPids: number[] = []
+
+  const killPid = (pid: number) => {
+    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+  }
+
+  beforeEach(async () => {
+    dir = mkdtempSync(path.join(tmpdir(), 'control-server-'))
+    const registry = createPortRegistry({
+      filePath: path.join(dir, 'port-registry.json'),
+      portMin: 30000,
+      portMax: 30010,
+      isPortBindable: async () => true,
+    })
+    const { port, stop } = await startDaemonControlServer({
+      getChildren: () => [],
+      stopSession: () => false,
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      requestShutdown: () => {},
+      onHappySessionWebhook: () => {},
+      portRegistry: registry,
+    })
+    baseUrl = `http://127.0.0.1:${port}`
+    stopServer = stop
+  })
+
+  afterEach(async () => {
+    for (const pid of spawnedPids) killPid(pid)
+    spawnedPids.length = 0
+    await stopServer()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  const startPost = async (body: unknown) =>
+    fetch(`${baseUrl}/start-server`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  const stopPost = async (body: unknown) =>
+    fetch(`${baseUrl}/stop-server`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+
+  it('stops a spawned server and returns sentSignal=SIGTERM', async () => {
+    const scriptPath = path.join(dir, 'sleep.js')
+    require('node:fs').writeFileSync(scriptPath, `setTimeout(() => process.exit(0), 15000)`)
+    const startRes = await startPost({ command: `node ${scriptPath}`, cwd: dir })
+    expect(startRes.status).toBe(200)
+    const { pid } = (await startRes.json()) as { pid: number }
+    spawnedPids.push(pid)
+    expect(() => process.kill(pid, 0)).not.toThrow()
+
+    const stopRes = await stopPost({ pid })
+    expect(stopRes.status).toBe(200)
+    const body = (await stopRes.json()) as { stopped: boolean; sentSignal: string }
+    expect(body).toEqual({ stopped: true, sentSignal: 'SIGTERM' })
+    await new Promise((r) => setTimeout(r, 50))
+    expect(() => process.kill(pid, 0)).toThrow()
+  })
+
+  it('returns 404 NO_SUCH_PROCESS for an unknown pid', async () => {
+    const res = await stopPost({ pid: 0x7fff_ffff })
+    expect(res.status).toBe(404)
+    const json = (await res.json()) as { code: string }
+    expect(json.code).toBe('NO_SUCH_PROCESS')
+  })
+
+  it('returns 400 for non-positive / non-integer pid', async () => {
+    const r1 = await stopPost({ pid: 0 })
+    expect(r1.status).toBe(400)
+    const r2 = await stopPost({ pid: -1 })
+    expect(r2.status).toBe(400)
+    const r3 = await stopPost({ pid: 1.5 })
+    expect(r3.status).toBe(400)
+  })
+
+  it('rejects 400 on missing pid field', async () => {
+    const res = await stopPost({})
+    expect(res.status).toBe(400)
+  })
+})

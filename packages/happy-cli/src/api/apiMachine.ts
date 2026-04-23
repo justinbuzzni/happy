@@ -16,6 +16,7 @@ import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgen
 import type { PortRegistry } from '@/daemon/portRegistry';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
+import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import type { ChildProcess } from 'node:child_process';
 
 interface ServerToDaemonEvents {
@@ -253,6 +254,30 @@ export class ApiMachineClient {
                 }
                 const message = e instanceof Error ? e.message : String(e);
                 logger.debug(`[API MACHINE] start-server internal error: ${message}`);
+                return { type: 'error', code: 'INTERNAL', message };
+            }
+        });
+
+        // Companion to `start-server` — signals the child with SIGTERM,
+        // falling back to SIGKILL if it does not exit gracefully. Envelope
+        // matches start-server: success or {code,message} error.
+        // See specs/preview-server-lifecycle/ Phase 5a.
+        this.rpcHandlerManager.registerHandler('stop-server', async (params: any) => {
+            const { pid } = params || {};
+            if (typeof pid !== 'number') {
+                return { type: 'error', code: 'INVALID_REQUEST', message: 'pid is required' };
+            }
+            try {
+                const result = await stopServerProcess({ pid });
+                logger.debug(`[API MACHINE] stop-server pid=${pid} signal=${result.sentSignal}`);
+                return { type: 'success', sentSignal: result.sentSignal };
+            } catch (e) {
+                if (e instanceof StopServerError) {
+                    logger.debug(`[API MACHINE] stop-server failed: ${e.code} ${e.message}`);
+                    return { type: 'error', code: e.code, message: e.message };
+                }
+                const message = e instanceof Error ? e.message : String(e);
+                logger.debug(`[API MACHINE] stop-server internal error: ${message}`);
                 return { type: 'error', code: 'INTERNAL', message };
             }
         });

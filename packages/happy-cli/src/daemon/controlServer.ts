@@ -13,6 +13,7 @@ import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/regist
 import { PortRegistry } from './portRegistry';
 import { proxyHttp, PreviewProxyError } from './previewProxy';
 import { startServerProcess, StartServerError } from './startServer';
+import { stopServerProcess, StopServerError } from './stopServer';
 import type { ChildProcess } from 'node:child_process';
 
 export function startDaemonControlServer({
@@ -327,6 +328,62 @@ export function startDaemonControlServer({
           return { code: e.code, error: e.message };
         }
         throw e;
+      }
+    });
+
+    // Stop a dev server spawned via /start-server. Graceful SIGTERM with
+    // SIGKILL fallback — see specs/preview-server-lifecycle/ Phase 5a.
+    typed.post('/stop-server', {
+      schema: {
+        body: z.object({
+          pid: z.number().int().positive()
+        }),
+        response: {
+          200: z.object({
+            stopped: z.literal(true),
+            sentSignal: z.enum(['SIGTERM', 'SIGKILL'])
+          }),
+          400: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          403: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          404: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          500: z.object({
+            code: z.string(),
+            error: z.string()
+          }),
+          504: z.object({
+            code: z.string(),
+            error: z.string()
+          })
+        }
+      }
+    }, async (request, reply) => {
+      try {
+        const result = await stopServerProcess({ pid: request.body.pid })
+        logger.debug(`[CONTROL SERVER] stop-server pid=${request.body.pid} signal=${result.sentSignal}`)
+        return { stopped: true as const, sentSignal: result.sentSignal }
+      } catch (e) {
+        if (e instanceof StopServerError) {
+          logger.debug(`[CONTROL SERVER] stop-server failed: ${e.code} ${e.message}`)
+          const status = (
+            e.code === 'INVALID_PID' ? 400 :
+            e.code === 'NO_SUCH_PROCESS' ? 404 :
+            e.code === 'PERMISSION_DENIED' ? 403 :
+            e.code === 'TIMEOUT' ? 504 :
+            500
+          )
+          reply.code(status)
+          return { code: e.code, error: e.message }
+        }
+        throw e
       }
     });
 
