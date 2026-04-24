@@ -21,6 +21,7 @@ export type PresetName =
     | 'go'
     | 'mobile'
     | 'editor'
+    | 'agent'
 
 export const PRESET_NAMES: readonly PresetName[] = [
     'common',
@@ -31,6 +32,7 @@ export const PRESET_NAMES: readonly PresetName[] = [
     'go',
     'mobile',
     'editor',
+    'agent',
 ]
 
 interface Preset {
@@ -92,6 +94,11 @@ const PRESETS: Record<PresetName, Preset> = {
     editor: {
         segments: ['.idea', '.vscode'],
         globs: ['*.swp', '*~'],
+    },
+    agent: {
+        // AI coding tool state dirs that leak agent memory/sessions if deployed.
+        segments: ['.claude', '.omc', '.happy', '.codex', '.cursor', '.aider'],
+        globs: [],
     },
 }
 

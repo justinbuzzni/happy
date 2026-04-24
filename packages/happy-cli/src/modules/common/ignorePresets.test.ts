@@ -59,6 +59,27 @@ describe('createIgnoreMatcher — default (all presets on)', () => {
         expect(matcher.shouldIgnore('backup~')).toBe(true)
     })
 
+    it('ignores AI coding agent state directories', () => {
+        expect(matcher.shouldIgnore('.claude')).toBe(true)
+        expect(matcher.shouldIgnore('.omc')).toBe(true)
+        expect(matcher.shouldIgnore('.happy')).toBe(true)
+        expect(matcher.shouldIgnore('.codex')).toBe(true)
+        expect(matcher.shouldIgnore('.cursor')).toBe(true)
+        expect(matcher.shouldIgnore('.aider')).toBe(true)
+    })
+
+    it('ignores agent paths when nested', () => {
+        expect(matcher.shouldIgnore('.claude/projects/x/memory/MEMORY.md')).toBe(true)
+        expect(matcher.shouldIgnore('.omc/sessions/y.json')).toBe(true)
+        expect(matcher.shouldIgnore('packages/foo/.cursor/rules.md')).toBe(true)
+    })
+
+    it('does NOT match partial segment for agent names', () => {
+        expect(matcher.shouldIgnore('my-.claude-backup')).toBe(false)
+        expect(matcher.shouldIgnore('cursor-app/file')).toBe(false)
+        expect(matcher.shouldIgnore('src/claude/helper.ts')).toBe(false)
+    })
+
     it('matches the pattern on any nested segment (not just the root)', () => {
         expect(matcher.shouldIgnore('src/node_modules/foo')).toBe(true)
         expect(matcher.shouldIgnore('a/b/.git/HEAD')).toBe(true)
@@ -120,9 +141,24 @@ describe('createIgnoreMatcher — selective presets', () => {
         expect(matcher.shouldIgnore('node_modules')).toBe(false)
     })
 
+    it('does not apply agent patterns when agent preset disabled', () => {
+        const matcher = createIgnoreMatcher({ presets: ['common'] })
+        expect(matcher.shouldIgnore('.claude')).toBe(false)
+        expect(matcher.shouldIgnore('.omc')).toBe(false)
+        expect(matcher.shouldIgnore('.cursor')).toBe(false)
+    })
+
+    it('agent preset alone only matches its own patterns', () => {
+        const matcher = createIgnoreMatcher({ presets: ['agent'] })
+        expect(matcher.shouldIgnore('.claude')).toBe(true)
+        expect(matcher.shouldIgnore('.omc')).toBe(true)
+        expect(matcher.shouldIgnore('node_modules')).toBe(false)
+        expect(matcher.shouldIgnore('.git')).toBe(false)
+    })
+
     it('PRESET_NAMES exposes all known presets', () => {
         expect(PRESET_NAMES).toEqual(
-            expect.arrayContaining(['common', 'node', 'python', 'rust', 'jvm', 'go', 'mobile', 'editor']),
+            expect.arrayContaining(['common', 'node', 'python', 'rust', 'jvm', 'go', 'mobile', 'editor', 'agent']),
         )
     })
 })
