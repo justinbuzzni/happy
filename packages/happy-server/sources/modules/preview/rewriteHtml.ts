@@ -48,13 +48,16 @@ export function rewriteHtml(html: string, prefix: string): string {
         .replace(ABS_PATH_ATTRS, rep)
         .replace(ABS_PATH_IMPORT, rep);
 
-    const interceptor = buildInterceptorScript(prefix);
+    // <base> pins the document base URL so relative-path resources
+    // (`<script src="app.js">`) survive the interceptor's history.replaceState.
+    const baseHref = `<base href="${prefix}/">`;
+    const headInjection = baseHref + buildInterceptorScript(prefix);
     if (out.includes('<head>')) {
-        out = out.replace('<head>', `<head>${interceptor}`);
+        out = out.replace('<head>', `<head>${headInjection}`);
     } else if (out.includes('<html>')) {
-        out = out.replace('<html>', `<html>${interceptor}`);
+        out = out.replace('<html>', `<html>${headInjection}`);
     } else {
-        out = interceptor + out;
+        out = headInjection + out;
     }
     return out;
 }

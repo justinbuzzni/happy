@@ -70,20 +70,41 @@ describe('rewriteHtml — absolute path rewriting', () => {
 });
 
 describe('rewriteHtml — interceptor injection', () => {
-    it('injects the interceptor script after <head>', () => {
+    it('injects <base href> before the interceptor script after <head>', () => {
         const out = rewriteHtml('<html><head></head><body></body></html>', PREFIX);
-        expect(out).toMatch(/<head><script>/);
+        expect(out).toMatch(new RegExp(`<head><base href="${PREFIX}/"><script>`));
     });
 
     it('injects after <html> when <head> is absent', () => {
         const out = rewriteHtml('<html><body></body></html>', PREFIX);
-        expect(out).toMatch(/<html><script>/);
+        expect(out).toMatch(new RegExp(`<html><base href="${PREFIX}/"><script>`));
     });
 
-    it('prepends interceptor when neither <head> nor <html> is present', () => {
+    it('prepends <base> + interceptor when neither <head> nor <html> is present', () => {
         const out = rewriteHtml('<div>naked fragment</div>', PREFIX);
-        expect(out.startsWith('<script>')).toBe(true);
+        expect(out.startsWith(`<base href="${PREFIX}/"><script>`)).toBe(true);
         expect(out).toContain('<div>naked fragment</div>');
+    });
+
+    // <base href> pins the document base URL so that relative-path resources
+    // (<script src="app.js">, <link href="style.css">) keep resolving through
+    // the relay even after the interceptor's history.replaceState mutates
+    // location.pathname. Without this, app.js requests fall back to the
+    // platform origin and the browser hits a SPA-fallback HTML page that
+    // fails JS parsing with "Unexpected token '<'".
+    // See specs/preview-api-proxy/ Phase 5 (R9).
+    it('injects <base href> with the configured prefix and trailing slash', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        expect(out).toContain(`<base href="${PREFIX}/">`);
+    });
+
+    it('places <base href> ahead of the interceptor script in document order', () => {
+        const out = rewriteHtml('<html><head></head></html>', PREFIX);
+        const baseIdx = out.indexOf('<base href=');
+        const scriptIdx = out.indexOf('<script>');
+        expect(baseIdx).toBeGreaterThanOrEqual(0);
+        expect(scriptIdx).toBeGreaterThanOrEqual(0);
+        expect(baseIdx).toBeLessThan(scriptIdx);
     });
 
     it('interceptor embeds the configured prefix', () => {
