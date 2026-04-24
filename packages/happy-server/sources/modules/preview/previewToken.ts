@@ -19,6 +19,13 @@ export interface PreviewTokenPayload {
     port: number;
 }
 
+export interface VerifiedPreviewToken extends PreviewTokenPayload {
+    /** Unix ms — when the signed token expires. Matches the `expiresAt` that
+     *  signPreviewToken returned at mint time. Exposed so callers (e.g. the
+     *  `/v1/preview` route setting a companion cookie) can derive Max-Age. */
+    exp: number;
+}
+
 export interface SignedPreviewToken {
     token: string;
     expiresAt: number;
@@ -87,7 +94,7 @@ export function signPreviewToken(
 export function verifyPreviewToken(
     token: string,
     options: PreviewTokenOptions = {},
-): PreviewTokenPayload | null {
+): VerifiedPreviewToken | null {
     const secret = getSecret(options.secret);
 
     if (typeof token !== 'string' || !token.includes('.')) {
@@ -117,5 +124,10 @@ export function verifyPreviewToken(
         return null;
     }
 
-    return { userId: payload.userId, machineId: payload.machineId, port: payload.port };
+    return {
+        userId: payload.userId,
+        machineId: payload.machineId,
+        port: payload.port,
+        exp: payload.exp,
+    };
 }

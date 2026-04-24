@@ -10,7 +10,8 @@ describe('previewToken', () => {
             { secret: SECRET },
         );
         const payload = verifyPreviewToken(signed.token, { secret: SECRET });
-        expect(payload).toEqual({ userId: 'u1', machineId: 'm1', port: 3000 });
+        // exp is exposed so Phase 9 cookie issuance can derive Max-Age.
+        expect(payload).toEqual({ userId: 'u1', machineId: 'm1', port: 3000, exp: signed.expiresAt });
     });
 
     it('returns expiresAt roughly ttlMs in the future', () => {

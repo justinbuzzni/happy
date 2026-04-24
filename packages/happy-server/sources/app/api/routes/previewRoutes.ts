@@ -23,6 +23,7 @@ import { db } from "@/storage/db";
 import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
 import { signPreviewToken, verifyPreviewToken } from "@/modules/preview/previewToken";
+import { readPreviewCookie, buildPreviewCookie } from "@/modules/preview/previewCookie";
 import { rewriteHtml, rewriteJsCss } from "@/modules/preview/rewriteHtml";
 import { type Fastify } from "../types";
 
@@ -142,18 +143,27 @@ export function previewRoutes(app: Fastify) {
                 const params = request.params as { machineId: string; port: string; '*'?: string };
                 const query = request.query as { ptoken?: string };
 
-                // Verify ptoken + cross-check against URL params.
-                const token = query.ptoken;
+                const portNum = Number.parseInt(params.port, 10);
+                if (!Number.isInteger(portNum)) {
+                    return reply.code(400).send({ error: 'Invalid port' });
+                }
+
+                // Phase 9: accept the token from either `?ptoken=` (initial
+                // iframe load) or the per-preview cookie (every subsequent
+                // subresource once the first response set it). Query wins
+                // when both are present — that's the web-ui's refresh path.
+                const cookieToken = readPreviewCookie(
+                    request.headers.cookie as string | undefined,
+                    params.machineId,
+                    portNum,
+                );
+                const token = query.ptoken ?? cookieToken;
                 if (!token) {
                     return reply.code(401).send({ error: 'Missing ptoken' });
                 }
                 const claims = verifyPreviewToken(token);
                 if (!claims) {
                     return reply.code(401).send({ error: 'Invalid or expired ptoken' });
-                }
-                const portNum = Number.parseInt(params.port, 10);
-                if (!Number.isInteger(portNum)) {
-                    return reply.code(400).send({ error: 'Invalid port' });
                 }
                 if (claims.machineId !== params.machineId || claims.port !== portNum) {
                     return reply.code(403).send({ error: 'Token does not match requested machine/port' });
@@ -234,6 +244,19 @@ export function previewRoutes(app: Fastify) {
                 }
                 // Always send fresh Content-Length because the body may have been rewritten.
                 outHeaders['Content-Length'] = String(responseBody.length);
+
+                // Phase 9: bake the token into a path-scoped HttpOnly cookie
+                // so the iframe's subresource requests authenticate without
+                // needing `?ptoken=` in their URLs. Max-Age tracks the signed
+                // ptoken's own expiry; the web-ui refreshes the iframe well
+                // before expiry (remotePreviewUrl REFRESH_MARGIN_MS = 5min).
+                const maxAgeSeconds = Math.floor(Math.max(0, claims.exp - Date.now()) / 1000);
+                outHeaders['Set-Cookie'] = buildPreviewCookie(
+                    params.machineId,
+                    portNum,
+                    token,
+                    maxAgeSeconds,
+                );
 
                 reply.raw.writeHead(rpcResponse.status, outHeaders);
                 reply.raw.end(responseBody);
