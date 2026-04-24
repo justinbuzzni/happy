@@ -132,6 +132,13 @@ export function previewRoutes(app: Fastify) {
     // register a raw-buffer content-type parser without affecting other JSON
     // routes on the same app.
     app.register(async (scope) => {
+        // Strip inherited built-in parsers (json, urlencoded, etc.) within
+        // this scope. addContentTypeParser('*', …) is a *fallback*, not an
+        // override — without this, JSON POST bodies are parsed into objects
+        // upstream and request.body.length is undefined, so the relay
+        // forwards the request with Content-Length set but no body, and the
+        // dev server hangs waiting for bytes that never arrive.
+        scope.removeAllContentTypeParsers();
         scope.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, body, done) => {
             done(null, body);
         });
