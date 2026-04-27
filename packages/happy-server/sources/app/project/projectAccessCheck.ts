@@ -1,4 +1,5 @@
 import { Project } from "@prisma/client";
+import { Result } from "./types";
 
 type Tx = {
     project: { findUnique: Function };
@@ -37,30 +38,32 @@ export async function hasProjectRole(
 
 /**
  * Load project and verify caller is owner.
- * Returns the project if authorized, null otherwise.
+ * Distinguishes 'project-not-found' from 'not-owner' so callers can surface
+ * the right error to the UI (and so the web-ui's lazy-backfill flow can
+ * detect a missing happy-server project and create it).
  */
 export async function getProjectAsOwner(
     tx: Tx,
     projectId: string,
     userId: string
-): Promise<Project | null> {
+): Promise<Result<Project>> {
     const project = await tx.project.findUnique({ where: { id: projectId } }) as Project | null;
     if (!project) {
-        return null;
+        return { ok: false, error: 'project-not-found' };
     }
 
     if (project.accountId === userId) {
-        return project;
+        return { ok: true, value: project };
     }
 
     const member = await tx.projectMember.findUnique({
         where: { projectId_accountId: { projectId, accountId: userId } }
     });
     if (member?.role === 'owner') {
-        return project;
+        return { ok: true, value: project };
     }
 
-    return null;
+    return { ok: false, error: 'not-owner' };
 }
 
 const ROLE_LEVEL: Record<string, number> = { viewer: 0, editor: 1, owner: 2 };

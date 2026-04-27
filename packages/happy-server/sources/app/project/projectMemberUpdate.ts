@@ -15,9 +15,9 @@ export async function projectMemberUpdate(
     role: ProjectRole
 ): Promise<Result<ProjectMemberInfo>> {
     return await inTx(async (tx) => {
-        const project = await getProjectAsOwner(tx, projectId, ctx.uid);
-        if (!project) {
-            return { ok: false, error: 'not-owner' };
+        const projectResult = await getProjectAsOwner(tx, projectId, ctx.uid);
+        if (!projectResult.ok) {
+            return projectResult;
         }
 
         const member = await tx.projectMember.findUnique({

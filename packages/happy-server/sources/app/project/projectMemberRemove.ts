@@ -22,9 +22,9 @@ export async function projectMemberRemove(
 
         const isSelf = member.accountId === ctx.uid;
         if (!isSelf) {
-            const project = await getProjectAsOwner(tx, projectId, ctx.uid);
-            if (!project) {
-                return { ok: false, error: 'not-owner' };
+            const projectResult = await getProjectAsOwner(tx, projectId, ctx.uid);
+            if (!projectResult.ok) {
+                return projectResult;
             }
         }
 
