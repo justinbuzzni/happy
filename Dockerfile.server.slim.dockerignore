@@ -1,0 +1,15 @@
+**
+
+!package.json
+!yarn.lock
+
+!patches/
+!patches/**
+
+!packages/
+!packages/happy-server/
+!packages/happy-server/**
+!packages/happy-wire/
+!packages/happy-wire/**
+
+!Dockerfile.server.slim
