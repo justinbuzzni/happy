@@ -40,8 +40,11 @@ export function projectRoutes(app: Fastify) {
         }
     }, async (request, reply) => {
         const ctx = Context.create(request.userId);
-        const project = await projectCreate(ctx, request.body);
-        return reply.send({ project: formatProject(project) });
+        const result = await projectCreate(ctx, request.body);
+        if (!result.ok) {
+            return reply.code(errorToStatus(result.error)).send({ error: result.error });
+        }
+        return reply.send({ project: formatProject(result.value) });
     });
 
     app.get('/v1/projects', {
@@ -141,6 +144,8 @@ function errorToStatus(error: ProjectError): number {
         case 'access-denied':
         case 'not-owner':
             return 403;
+        case 'id-taken':
+            return 409;
         default:
             return 400;
     }
