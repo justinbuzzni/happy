@@ -66,14 +66,30 @@ export async function sessionDelete(ctx: Context, sessionId: string): Promise<bo
         const deletedAccessKeys = await tx.accessKey.deleteMany({
             where: { sessionId }
         });
-        log({ 
-            module: 'session-delete', 
-            userId: ctx.uid, 
+        log({
+            module: 'session-delete',
+            userId: ctx.uid,
             sessionId,
             deletedCount: deletedAccessKeys.count
         }, `Deleted ${deletedAccessKeys.count} access keys`);
 
-        // 4. Delete the session itself
+        // 4. Delete session events (turn-start/end, mcp__happy__change_title,
+        // fork markers, etc — persisted via persistSessionEvent.ts and queried
+        // through GET /v3/sessions/:id/events). The original cascade missed
+        // this table, so any session that ever emitted an event would fail
+        // tx.session.delete with a foreign-key violation and surface as a
+        // 500 to clients calling DELETE /v1/sessions/:id.
+        const deletedEvents = await tx.sessionEvent.deleteMany({
+            where: { sessionId }
+        });
+        log({
+            module: 'session-delete',
+            userId: ctx.uid,
+            sessionId,
+            deletedCount: deletedEvents.count
+        }, `Deleted ${deletedEvents.count} session events`);
+
+        // 5. Delete the session itself
         await tx.session.delete({
             where: { id: sessionId }
         });
