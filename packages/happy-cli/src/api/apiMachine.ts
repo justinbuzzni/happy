@@ -22,6 +22,8 @@ import {
     addDaemonTerminalSession,
     getDaemonTerminalSession,
     killAllDaemonTerminalSessions,
+    recordBytesIn,
+    recordBytesOut,
     removeDaemonTerminalSession,
 } from '@/daemon/daemonTerminalSessions';
 import type { ChildProcess } from 'node:child_process';
@@ -468,9 +470,10 @@ export class ApiMachineClient {
             // specs/remote-terminal/ Phase 2 — relay path is broken once
             // the socket drops, and the server's session map entry now
             // points at a dead socket. Kill local PTYs so no orphans
-            // outlive the daemon's connection. TODO(Phase 5): replace
-            // with a 30s grace timer so brief reconnects keep sessions
-            // alive (Q4).
+            // outlive the daemon's connection. The 30s grace timer (Q4)
+            // is deferred to a future remote-terminal-detach-attach spec
+            // since it requires server+daemon coordinated state for any
+            // real reattach value (Phase 5 review).
             const killed = killAllDaemonTerminalSessions('SIGTERM');
             if (killed > 0) {
                 logger.debug(`[API MACHINE] Killed ${killed} terminal session(s) on disconnect`);
@@ -527,6 +530,7 @@ export class ApiMachineClient {
         // `terminal-frame`, so happy-server never sees plaintext.
         const machineKey = this.machine.encryptionKey;
         const machineVariant = this.machine.encryptionVariant;
+        const machineId = this.machine.id;
         this.socket.on('terminal-open-fwd', async (msg, ack) => {
             try {
                 const { sessionId, params } = msg || {};
@@ -544,10 +548,11 @@ export class ApiMachineClient {
                         return;
                     }
                 }
+                const auditUserId = typeof opts?.userId === 'string' ? opts.userId : 'remote-client';
                 let pty: ReturnType<typeof createPtySession>;
                 try {
                     pty = createPtySession({
-                        userId: typeof opts?.userId === 'string' ? opts.userId : 'remote-client',
+                        userId: auditUserId,
                         shell: typeof opts?.shell === 'string' ? opts.shell : undefined,
                         args: Array.isArray(opts?.args) ? opts.args : undefined,
                         cwd: typeof opts?.cwd === 'string' ? opts.cwd : undefined,
@@ -561,8 +566,12 @@ export class ApiMachineClient {
                     ack({ ok: false, error: message });
                     return;
                 }
-                addDaemonTerminalSession(sessionId, pty);
+                const entry = addDaemonTerminalSession(sessionId, pty, {
+                    userId: auditUserId,
+                    machineId,
+                });
                 pty.onData((chunk) => {
+                    recordBytesOut(sessionId, chunk.length);
                     try {
                         const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
                         this.socket.emit('terminal-frame', { sessionId, data });
@@ -572,9 +581,21 @@ export class ApiMachineClient {
                 });
                 pty.onExit((code, signal) => {
                     this.socket.emit('terminal-closed', { sessionId, code, signal });
+                    const closedAt = Date.now();
+                    // Audit log per specs/remote-terminal/ §3 #7. Body is
+                    // intentionally NOT recorded — only metadata. logger.debug
+                    // writes to the daemon log file without disrupting an
+                    // interactive Claude session sharing the terminal.
+                    logger.debug(
+                        `[REMOTE-TERMINAL] close session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} ` +
+                        `exitCode=${code} signal=${signal ?? 'null'} bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} ` +
+                        `durationMs=${closedAt - entry.openedAt}`,
+                    );
                     removeDaemonTerminalSession(sessionId);
                 });
-                logger.debug(`[API MACHINE] terminal-open-fwd session=${sessionId} pid=${pty.pid}`);
+                logger.debug(
+                    `[REMOTE-TERMINAL] open session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} pid=${pty.pid}`,
+                );
                 ack({ ok: true, pid: pty.pid });
             } catch (e) {
                 const message = e instanceof Error ? e.message : String(e);
@@ -585,12 +606,13 @@ export class ApiMachineClient {
 
         this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
-            const pty = getDaemonTerminalSession(sessionId);
-            if (!pty || typeof data !== 'string') return;
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry || typeof data !== 'string') return;
             try {
                 const chunk = decrypt(machineKey, machineVariant, decodeBase64(data));
                 if (typeof chunk === 'string') {
-                    pty.write(chunk);
+                    entry.session.write(chunk);
+                    recordBytesIn(sessionId, chunk.length);
                 }
             } catch (e) {
                 logger.debug(`[API MACHINE] terminal-frame-fwd decrypt failed: ${(e as Error).message}`);
@@ -599,17 +621,17 @@ export class ApiMachineClient {
 
         this.socket.on('terminal-resize-fwd', (msg) => {
             const { sessionId, cols, rows } = msg || {};
-            const pty = getDaemonTerminalSession(sessionId);
-            if (!pty) return;
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry) return;
             if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
-            pty.resize(cols, rows);
+            entry.session.resize(cols, rows);
         });
 
         this.socket.on('terminal-close-fwd', (msg) => {
             const { sessionId } = msg || {};
-            const pty = getDaemonTerminalSession(sessionId);
-            if (!pty) return;
-            pty.kill('SIGTERM');
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry) return;
+            entry.session.kill('SIGTERM');
             // onExit handler clears the entry; remove explicitly in case
             // the kill races with reconnect.
             removeDaemonTerminalSession(sessionId);
