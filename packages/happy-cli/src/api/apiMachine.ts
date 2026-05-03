@@ -8,6 +8,8 @@ import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
 import { registerCommonHandlers, SpawnSessionOptions, SpawnSessionResult } from '../modules/common/registerCommonHandlers';
+import { resolveAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { backoff } from '@/utils/time';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
@@ -138,7 +140,21 @@ export class ApiMachineClient {
             logger: (msg, data) => logger.debug(msg, data)
         });
 
-        registerCommonHandlers(this.rpcHandlerManager, process.cwd());
+        // specs/daemon-rpc-workspace-rebase/ Phase 2 — rebase the
+        // path-validation root for machine-scoped RPCs (getDirectoryTree
+        // / readFile / writeFile / etc.) onto the user's home directory
+        // (or HAPPY_WORKSPACE_ROOT if the operator explicitly puts the
+        // workspace outside home, e.g. /opt/work). Previously this used
+        // process.cwd(), which made the RPC surface depend on whichever
+        // shell the user happened to start `happy daemon start` in,
+        // breaking the cross-identity Files tab when the daemon was
+        // launched from / or any directory that doesn't enclose the
+        // project's workspaceDir.
+        const allowedRoot = resolveAllowedRoot({
+            registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
+            homeDir: homedir(),
+        });
+        registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
     }
 
     setRPCHandlers({
