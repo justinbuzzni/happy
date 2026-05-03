@@ -124,6 +124,51 @@ yarn workspace happy cli --help
 - For Codex: `codex` CLI installed & logged in
 - For Gemini: `npm install -g @google/gemini-cli` + `happy connect gemini`
 
+## Troubleshooting
+
+### Remote terminal — `posix_spawnp failed.` on macOS
+
+Symptom (web-ui "터미널" tab 또는 daemon log):
+```
+[REMOTE-TERMINAL] terminal-open-fwd spawn failed: posix_spawnp failed.
+```
+
+Cause: npm extracts `node-pty/prebuilds/darwin-{arm64,x64}/spawn-helper`
+without the executable bit (`0o644`), so macOS `posix_spawnp` refuses
+to `execve()` it. Linux uses `forkpty + execvp` and is unaffected.
+
+**Auto-fix**: shipped in `@namsangboy/happy-cli@1.1.4-aplus.9+` —
+postinstall flips the bit on macOS. Just upgrade:
+
+```bash
+npm i -g @namsangboy/happy-cli@latest
+happy daemon stop && happy daemon start
+```
+
+**Manual fix (older versions)**:
+
+```bash
+chmod +x $(npm root -g)/@namsangboy/happy-cli/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
+chmod +x $(npm root -g)/@namsangboy/happy-cli/node_modules/node-pty/prebuilds/darwin-x64/spawn-helper
+happy daemon stop && happy daemon start
+```
+
+**Or rebuild from source** (also works, but requires Xcode CLT):
+
+```bash
+xcode-select --install   # if not already
+npm i -g @namsangboy/happy-cli@latest --build-from-source
+```
+
+### Other
+
+- `happy doctor` runs platform diagnostics and is the first thing to try
+  before opening an issue.
+- daemon logs live in `~/.happy/logs/*-daemon.log`. Grep for
+  `[REMOTE-TERMINAL]` to inspect terminal-relay traffic without leaking
+  payload bodies (only metadata is logged — `bytesIn`, `bytesOut`,
+  `exitCode`, `signal`, `durationMs`).
+
 ## License
 
 MIT
