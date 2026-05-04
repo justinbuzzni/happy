@@ -1,13 +1,14 @@
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
-import { readFile, writeFile, readdir, stat } from 'fs/promises';
+import { readFile, writeFile, readdir, stat, mkdir } from 'fs/promises';
 import { createHash } from 'crypto';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import { validatePath } from './pathSecurity';
+import { ensureDirectory } from './ensureDirectory';
 import { createIgnoreMatcher } from './ignorePresets';
 import {
     createGitignoreContext,
@@ -73,6 +74,15 @@ interface DirectoryEntry {
 interface ListDirectoryResponse {
     success: boolean;
     entries?: DirectoryEntry[];
+    error?: string;
+}
+
+interface EnsureDirectoryRequest {
+    path: string;
+}
+
+interface EnsureDirectoryResponse {
+    success: boolean;
     error?: string;
 }
 
@@ -312,8 +322,13 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
                 }
             }
 
-            // Write the file
+            // Write the file. Auto-create the parent directory so the
+            // first writeFile to a freshly-bound project doesn't fail
+            // with ENOENT (specs/project-workspace-auto-create/ Phase 2).
+            // mkdir({ recursive: true }) is idempotent and stays inside
+            // the validated path, so traversal defense is unaffected.
             const buffer = Buffer.from(data.content, 'base64');
+            await mkdir(dirname(validation.resolvedPath!), { recursive: true });
             await writeFile(validation.resolvedPath!, buffer);
 
             // Calculate and return hash of written file
@@ -383,6 +398,17 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             logger.debug('Failed to list directory:', error);
             return { success: false, error: error instanceof Error ? error.message : 'Failed to list directory' };
         }
+    });
+
+    // Ensure directory exists — creates the target and any missing
+    // parents inside the allowed working directory. Idempotent.
+    // Used by web-ui to bootstrap a freshly-created project's
+    // workspaceDir before the first terminal/upload (see
+    // specs/project-workspace-auto-create/).
+    rpcHandlerManager.registerHandler<EnsureDirectoryRequest, EnsureDirectoryResponse>('ensureDirectory', async (data) => {
+        logger.debug('Ensure directory request:', data.path);
+        const result = await ensureDirectory(data.path, workingDirectory);
+        return { success: result.success, error: result.error };
     });
 
     // Get directory tree handler - recursive with depth control

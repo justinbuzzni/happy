@@ -36,6 +36,7 @@ export function machinesRoutes(app: Fastify) {
             return reply.send({
                 machine: {
                     id: machine.id,
+                    accountId: machine.accountId,
                     metadata: machine.metadata,
                     metadataVersion: machine.metadataVersion,
                     daemonState: machine.daemonState,
@@ -93,6 +94,7 @@ export function machinesRoutes(app: Fastify) {
             return reply.send({
                 machine: {
                     id: newMachine.id,
+                    accountId: newMachine.accountId,
                     metadata: newMachine.metadata,
                     metadataVersion: newMachine.metadataVersion,
                     daemonState: newMachine.daemonState,
@@ -121,6 +123,10 @@ export function machinesRoutes(app: Fastify) {
 
         return machines.map(m => ({
             id: m.id,
+            // specs/cross-identity-machine-socket/ Phase 1 — web-ui needs
+            // the machine owner accountId so it can pick the right Happy
+            // identity (boost socket) when the active context differs.
+            accountId: m.accountId,
             metadata: m.metadata,
             metadataVersion: m.metadataVersion,
             daemonState: m.daemonState,
@@ -196,6 +202,7 @@ export function machinesRoutes(app: Fastify) {
         return {
             machine: {
                 id: machine.id,
+                accountId: machine.accountId,
                 metadata: machine.metadata,
                 metadataVersion: machine.metadataVersion,
                 daemonState: machine.daemonState,

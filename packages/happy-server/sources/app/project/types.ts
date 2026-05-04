@@ -47,7 +47,8 @@ export type ProjectError =
     | 'branch-exists'
     | 'merge-request-not-found'
     | 'merge-request-not-open'
-    | 'merge-conflict';
+    | 'merge-conflict'
+    | 'id-taken';
 
 export type Result<T> =
     | { ok: true; value: T }

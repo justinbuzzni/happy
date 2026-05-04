@@ -8,6 +8,8 @@ import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
 import { registerCommonHandlers, SpawnSessionOptions, SpawnSessionResult } from '../modules/common/registerCommonHandlers';
+import { resolveAllowedRoot } from '../modules/common/resolveAllowedRoot';
+import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { backoff } from '@/utils/time';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
@@ -17,6 +19,15 @@ import type { PortRegistry } from '@/daemon/portRegistry';
 import { proxyHttp, PreviewProxyError } from '@/daemon/previewProxy';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
+import { createPtySession } from '@/daemon/remoteTerminal';
+import {
+    addDaemonTerminalSession,
+    getDaemonTerminalSession,
+    killAllDaemonTerminalSessions,
+    recordBytesIn,
+    recordBytesOut,
+    removeDaemonTerminalSession,
+} from '@/daemon/daemonTerminalSessions';
 import type { ChildProcess } from 'node:child_process';
 
 interface ServerToDaemonEvents {
@@ -32,6 +43,16 @@ interface ServerToDaemonEvents {
         },
         ack: (response: unknown) => void,
     ) => void;
+    // specs/remote-terminal/ Phase 2 — server forwards terminal control
+    // events here. `params` / `data` payloads are E2EE between the
+    // daemon and the originating client; happy-server only routes them.
+    'terminal-open-fwd': (
+        msg: { sessionId: string; params: string | null },
+        ack: (response: unknown) => void,
+    ) => void;
+    'terminal-frame-fwd': (msg: { sessionId: string; data: string }) => void;
+    'terminal-resize-fwd': (msg: { sessionId: string; cols: number; rows: number }) => void;
+    'terminal-close-fwd': (msg: { sessionId: string }) => void;
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
@@ -84,6 +105,11 @@ interface DaemonToServerEvents {
         result?: any
         error?: string
     }) => void) => void;
+    // specs/remote-terminal/ Phase 2 — daemon-originated stream frames.
+    // `data` is the E2EE-encrypted PTY chunk; happy-server forwards it
+    // to the client without inspection.
+    'terminal-frame': (msg: { sessionId: string; data: string }) => void;
+    'terminal-closed': (msg: { sessionId: string; code: number; signal: number | null }) => void;
 }
 
 type MachineRpcHandlers = {
@@ -114,7 +140,21 @@ export class ApiMachineClient {
             logger: (msg, data) => logger.debug(msg, data)
         });
 
-        registerCommonHandlers(this.rpcHandlerManager, process.cwd());
+        // specs/daemon-rpc-workspace-rebase/ Phase 2 — rebase the
+        // path-validation root for machine-scoped RPCs (getDirectoryTree
+        // / readFile / writeFile / etc.) onto the user's home directory
+        // (or HAPPY_WORKSPACE_ROOT if the operator explicitly puts the
+        // workspace outside home, e.g. /opt/work). Previously this used
+        // process.cwd(), which made the RPC surface depend on whichever
+        // shell the user happened to start `happy daemon start` in,
+        // breaking the cross-identity Files tab when the daemon was
+        // launched from / or any directory that doesn't enclose the
+        // project's workspaceDir.
+        const allowedRoot = resolveAllowedRoot({
+            registryWorkspaceRoot: process.env.HAPPY_WORKSPACE_ROOT ?? null,
+            homeDir: homedir(),
+        });
+        registerCommonHandlers(this.rpcHandlerManager, allowedRoot);
     }
 
     setRPCHandlers({
@@ -443,6 +483,17 @@ export class ApiMachineClient {
             logger.debug('[API MACHINE] Disconnected from server');
             this.rpcHandlerManager.onSocketDisconnect();
             this.stopKeepAlive();
+            // specs/remote-terminal/ Phase 2 — relay path is broken once
+            // the socket drops, and the server's session map entry now
+            // points at a dead socket. Kill local PTYs so no orphans
+            // outlive the daemon's connection. The 30s grace timer (Q4)
+            // is deferred to a future remote-terminal-detach-attach spec
+            // since it requires server+daemon coordinated state for any
+            // real reattach value (Phase 5 review).
+            const killed = killAllDaemonTerminalSessions('SIGTERM');
+            if (killed > 0) {
+                logger.debug(`[API MACHINE] Killed ${killed} terminal session(s) on disconnect`);
+            }
         });
 
         // Single consolidated RPC handler
@@ -483,6 +534,124 @@ export class ApiMachineClient {
                 }
             },
         );
+
+        // specs/remote-terminal/ Phase 2 — interactive PTY relay.
+        //
+        // happy-server has already gated this on userId-owns-machineId
+        // (terminalRelayHandler.ts ACL) so by the time `terminal-open-fwd`
+        // arrives the daemon trusts the request. The `params` blob is
+        // E2EE-encrypted by the originating client with the same key the
+        // rpc-call pipeline uses; we decrypt to extract cols/rows/cwd/etc.
+        // PTY stdout is encrypted on this side before being forwarded as
+        // `terminal-frame`, so happy-server never sees plaintext.
+        const machineKey = this.machine.encryptionKey;
+        const machineVariant = this.machine.encryptionVariant;
+        const machineId = this.machine.id;
+        this.socket.on('terminal-open-fwd', async (msg, ack) => {
+            try {
+                const { sessionId, params } = msg || {};
+                if (!sessionId || typeof sessionId !== 'string') {
+                    ack({ ok: false, error: 'sessionId is required' });
+                    return;
+                }
+                let opts: any = null;
+                if (params && typeof params === 'string') {
+                    try {
+                        opts = decrypt(machineKey, machineVariant, decodeBase64(params));
+                    } catch (e) {
+                        logger.debug(`[API MACHINE] terminal-open-fwd decrypt failed: ${(e as Error).message}`);
+                        ack({ ok: false, error: 'Failed to decrypt open params' });
+                        return;
+                    }
+                }
+                const auditUserId = typeof opts?.userId === 'string' ? opts.userId : 'remote-client';
+                let pty: ReturnType<typeof createPtySession>;
+                try {
+                    pty = createPtySession({
+                        userId: auditUserId,
+                        shell: typeof opts?.shell === 'string' ? opts.shell : undefined,
+                        args: Array.isArray(opts?.args) ? opts.args : undefined,
+                        cwd: typeof opts?.cwd === 'string' ? opts.cwd : undefined,
+                        env: opts?.env && typeof opts.env === 'object' ? opts.env : undefined,
+                        cols: Number.isInteger(opts?.cols) ? opts.cols : undefined,
+                        rows: Number.isInteger(opts?.rows) ? opts.rows : undefined,
+                    });
+                } catch (e) {
+                    const message = e instanceof Error ? e.message : String(e);
+                    logger.debug(`[API MACHINE] terminal-open-fwd spawn failed: ${message}`);
+                    ack({ ok: false, error: message });
+                    return;
+                }
+                const entry = addDaemonTerminalSession(sessionId, pty, {
+                    userId: auditUserId,
+                    machineId,
+                });
+                pty.onData((chunk) => {
+                    recordBytesOut(sessionId, chunk.length);
+                    try {
+                        const data = encodeBase64(encrypt(machineKey, machineVariant, chunk));
+                        this.socket.emit('terminal-frame', { sessionId, data });
+                    } catch (e) {
+                        logger.debug(`[API MACHINE] terminal-frame encrypt failed: ${(e as Error).message}`);
+                    }
+                });
+                pty.onExit((code, signal) => {
+                    this.socket.emit('terminal-closed', { sessionId, code, signal });
+                    const closedAt = Date.now();
+                    // Audit log per specs/remote-terminal/ §3 #7. Body is
+                    // intentionally NOT recorded — only metadata. logger.debug
+                    // writes to the daemon log file without disrupting an
+                    // interactive Claude session sharing the terminal.
+                    logger.debug(
+                        `[REMOTE-TERMINAL] close session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} ` +
+                        `exitCode=${code} signal=${signal ?? 'null'} bytesIn=${entry.bytesIn} bytesOut=${entry.bytesOut} ` +
+                        `durationMs=${closedAt - entry.openedAt}`,
+                    );
+                    removeDaemonTerminalSession(sessionId);
+                });
+                logger.debug(
+                    `[REMOTE-TERMINAL] open session=${sessionId} user=${entry.userId} machine=${entry.machineId ?? '-'} pid=${pty.pid}`,
+                );
+                ack({ ok: true, pid: pty.pid });
+            } catch (e) {
+                const message = e instanceof Error ? e.message : String(e);
+                logger.debug(`[API MACHINE] terminal-open-fwd internal error: ${message}`);
+                ack({ ok: false, error: 'Internal error' });
+            }
+        });
+
+        this.socket.on('terminal-frame-fwd', (msg) => {
+            const { sessionId, data } = msg || {};
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry || typeof data !== 'string') return;
+            try {
+                const chunk = decrypt(machineKey, machineVariant, decodeBase64(data));
+                if (typeof chunk === 'string') {
+                    entry.session.write(chunk);
+                    recordBytesIn(sessionId, chunk.length);
+                }
+            } catch (e) {
+                logger.debug(`[API MACHINE] terminal-frame-fwd decrypt failed: ${(e as Error).message}`);
+            }
+        });
+
+        this.socket.on('terminal-resize-fwd', (msg) => {
+            const { sessionId, cols, rows } = msg || {};
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry) return;
+            if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) return;
+            entry.session.resize(cols, rows);
+        });
+
+        this.socket.on('terminal-close-fwd', (msg) => {
+            const { sessionId } = msg || {};
+            const entry = getDaemonTerminalSession(sessionId);
+            if (!entry) return;
+            entry.session.kill('SIGTERM');
+            // onExit handler clears the entry; remove explicitly in case
+            // the kill races with reconnect.
+            removeDaemonTerminalSession(sessionId);
+        });
 
         // Handle update events from server
         this.socket.on('update', (data: Update) => {
