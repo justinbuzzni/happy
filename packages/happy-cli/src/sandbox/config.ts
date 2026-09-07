@@ -1,6 +1,7 @@
-import { readFileSync, statSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
 import type { SandboxConfig } from '@/persistence';
 
@@ -20,30 +21,89 @@ function expandPath(pathValue: string, sessionPath: string): string {
  * with EPERM even though the session's own files are writable.
  */
 function resolveGitWorktreeWritableRoot(sessionPath: string): string | undefined {
-    const gitPath = resolve(sessionPath, '.git');
-    let gitPathStat;
     try {
-        gitPathStat = statSync(gitPath);
-    } catch {
-        return undefined;
-    }
-    if (!gitPathStat.isFile()) {
-        // A plain directory `.git` (main checkout) is already inside sessionPath.
-        return undefined;
-    }
+        const gitEnv = { ...process.env };
+        delete gitEnv.GIT_DIR;
+        delete gitEnv.GIT_WORK_TREE;
+        delete gitEnv.GIT_COMMON_DIR;
+        gitEnv.GIT_CONFIG_NOSYSTEM = '1';
+        gitEnv.GIT_CONFIG_GLOBAL = process.platform === 'win32' ? 'NUL' : '/dev/null';
+        gitEnv.GIT_CONFIG_COUNT = '0';
 
-    const gitFileMatch = readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+?)\s*$/m);
-    if (!gitFileMatch) {
-        return undefined;
-    }
-    const worktreeGitDir = isAbsolute(gitFileMatch[1]) ? gitFileMatch[1] : resolve(sessionPath, gitFileMatch[1]);
+        const canonicalSessionPath = realpathSync(sessionPath);
+        const worktreeRoot = execFileSync(
+            'git',
+            ['-C', canonicalSessionPath, 'rev-parse', '--show-toplevel'],
+            { encoding: 'utf8', env: gitEnv, stdio: ['ignore', 'pipe', 'ignore'] },
+        ).trim();
+        const canonicalWorktreeRoot = realpathSync(worktreeRoot);
+        const sessionRelativeToRoot = relative(canonicalWorktreeRoot, canonicalSessionPath);
+        if (sessionRelativeToRoot === '..'
+            || sessionRelativeToRoot.startsWith(`..${sep}`)
+            || isAbsolute(sessionRelativeToRoot)) {
+            return undefined;
+        }
 
-    try {
-        const commonDirRelative = readFileSync(resolve(worktreeGitDir, 'commondir'), 'utf8').trim();
-        return isAbsolute(commonDirRelative) ? commonDirRelative : resolve(worktreeGitDir, commonDirRelative);
+        const gitPath = resolve(canonicalWorktreeRoot, '.git');
+        if (!statSync(gitPath).isFile()) {
+            // A plain directory `.git` (main checkout) is already inside the worktree.
+            return undefined;
+        }
+
+        const gitFileMatch = readFileSync(gitPath, 'utf8').match(/^gitdir:\s*([^\r\n]+)\r?\n?$/);
+        if (!gitFileMatch) {
+            return undefined;
+        }
+        const worktreeGitDirPath = isAbsolute(gitFileMatch[1])
+            ? gitFileMatch[1]
+            : resolve(dirname(gitPath), gitFileMatch[1]);
+        const canonicalWorktreeGitDir = realpathSync(worktreeGitDirPath);
+        if (!statSync(canonicalWorktreeGitDir).isDirectory()) {
+            return undefined;
+        }
+        const gitReportedWorktreeGitDir = execFileSync(
+            'git',
+            ['-C', canonicalSessionPath, 'rev-parse', '--absolute-git-dir'],
+            { encoding: 'utf8', env: gitEnv, stdio: ['ignore', 'pipe', 'ignore'] },
+        ).trim();
+        if (realpathSync(gitReportedWorktreeGitDir) !== canonicalWorktreeGitDir) {
+            return undefined;
+        }
+
+        const backlinkValue = readFileSync(resolve(canonicalWorktreeGitDir, 'gitdir'), 'utf8').trim();
+        const backlinkPath = isAbsolute(backlinkValue)
+            ? backlinkValue
+            : resolve(canonicalWorktreeGitDir, backlinkValue);
+        if (realpathSync(backlinkPath) !== realpathSync(gitPath)) {
+            return undefined;
+        }
+
+        const commonDirValue = readFileSync(resolve(canonicalWorktreeGitDir, 'commondir'), 'utf8').trim();
+        const commonDirPath = isAbsolute(commonDirValue)
+            ? commonDirValue
+            : resolve(canonicalWorktreeGitDir, commonDirValue);
+        const canonicalCommonDir = realpathSync(commonDirPath);
+        if (!statSync(canonicalCommonDir).isDirectory()
+            || dirname(dirname(canonicalWorktreeGitDir)) !== canonicalCommonDir) {
+            return undefined;
+        }
+
+        const gitReportedCommonDir = execFileSync(
+            'git',
+            ['-C', canonicalSessionPath, 'rev-parse', '--git-common-dir'],
+            { encoding: 'utf8', env: gitEnv, stdio: ['ignore', 'pipe', 'ignore'] },
+        ).trim();
+        const gitReportedCommonDirPath = isAbsolute(gitReportedCommonDir)
+            ? gitReportedCommonDir
+            : resolve(canonicalSessionPath, gitReportedCommonDir);
+        if (realpathSync(gitReportedCommonDirPath) !== canonicalCommonDir) {
+            return undefined;
+        }
+
+        return canonicalCommonDir;
     } catch {
-        // No commondir file — grant the per-worktree gitdir itself so plumbing still works.
-        return worktreeGitDir;
+        // Invalid, unreadable, or concurrently changed Git metadata must not widen allowWrite.
+        return undefined;
     }
 }
 

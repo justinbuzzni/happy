@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
@@ -201,15 +202,15 @@ describe('buildSandboxRuntimeConfig with a linked git worktree', () => {
 
         const mainRepo = join(root, 'main-repo');
         const worktreePath = join(root, 'linked-worktree');
-        const commonGitDir = join(mainRepo, '.git');
-        const worktreeGitDir = join(commonGitDir, 'worktrees', 'linked-worktree');
+        execFileSync('git', ['-c', 'init.defaultBranch=main', 'init', mainRepo]);
+        execFileSync('git', ['-C', mainRepo, 'config', 'user.name', 'Happy Test']);
+        execFileSync('git', ['-C', mainRepo, 'config', 'user.email', 'happy-test@example.com']);
+        writeFileSync(join(mainRepo, 'tracked.txt'), 'initial\n');
+        execFileSync('git', ['-C', mainRepo, 'add', 'tracked.txt']);
+        execFileSync('git', ['-C', mainRepo, 'commit', '-m', 'initial']);
+        execFileSync('git', ['-C', mainRepo, 'worktree', 'add', '-b', 'linked', worktreePath]);
 
-        mkdirSync(worktreeGitDir, { recursive: true });
-        mkdirSync(worktreePath, { recursive: true });
-        writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n');
-        writeFileSync(join(worktreePath, '.git'), `gitdir: ${worktreeGitDir}\n`);
-
-        return { worktreePath, commonGitDir };
+        return { worktreePath, commonGitDir: realpathSync(join(mainRepo, '.git')) };
     }
 
     it('adds the resolved common gitdir to allowWrite so git add/fetch/commit can write index.lock, FETCH_HEAD, and refs', () => {
@@ -220,7 +221,7 @@ describe('buildSandboxRuntimeConfig with a linked git worktree', () => {
         expect(runtimeConfig.filesystem?.allowWrite).toContain(commonGitDir);
     });
 
-    it('falls back to the per-worktree gitdir when no commondir file exists', () => {
+    it('does not trust an arbitrary gitdir when no commondir file exists', () => {
         const root = mkdtempSync(join(tmpdir(), 'happy-sandbox-worktree-'));
         createdRoots.push(root);
         const worktreePath = join(root, 'linked-worktree');
@@ -231,7 +232,52 @@ describe('buildSandboxRuntimeConfig with a linked git worktree', () => {
 
         const runtimeConfig = buildSandboxRuntimeConfig(createConfig(), worktreePath);
 
-        expect(runtimeConfig.filesystem?.allowWrite).toContain(worktreeGitDir);
+        expect(runtimeConfig.filesystem?.allowWrite).not.toContain(worktreeGitDir);
+    });
+
+    it('does not widen allowWrite for an attacker-selected gitdir', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happy-sandbox-worktree-'));
+        createdRoots.push(root);
+        writeFileSync(join(root, '.git'), 'gitdir: /\n');
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig({ sessionIsolation: 'strict' }), root);
+
+        expect(runtimeConfig.filesystem?.allowWrite).not.toContain('/');
+    });
+
+    it('does not throw or widen allowWrite when the gitfile is unreadable', () => {
+        const { worktreePath, commonGitDir } = createLinkedWorktree();
+        const gitFile = join(worktreePath, '.git');
+        chmodSync(gitFile, 0);
+
+        try {
+            const runtimeConfig = buildSandboxRuntimeConfig(createConfig(), worktreePath);
+            expect(runtimeConfig.filesystem?.allowWrite).not.toContain(commonGitDir);
+        } finally {
+            chmodSync(gitFile, 0o600);
+        }
+    });
+
+    it('does not widen allowWrite when commondir is tampered with', () => {
+        const { worktreePath } = createLinkedWorktree();
+        const gitFileValue = readFileSync(join(worktreePath, '.git'), 'utf8');
+        const worktreeGitDir = gitFileValue.match(/^gitdir:\s*(.+)\s*$/)?.[1];
+        expect(worktreeGitDir).toBeDefined();
+        writeFileSync(join(worktreeGitDir!, 'commondir'), '/\n');
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig({ sessionIsolation: 'strict' }), worktreePath);
+
+        expect(runtimeConfig.filesystem?.allowWrite).not.toContain('/');
+    });
+
+    it('discovers linked-worktree metadata when the session starts in a subdirectory', () => {
+        const { worktreePath, commonGitDir } = createLinkedWorktree();
+        const nestedSessionPath = join(worktreePath, 'nested');
+        mkdirSync(nestedSessionPath);
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig(), nestedSessionPath);
+
+        expect(runtimeConfig.filesystem?.allowWrite).toContain(commonGitDir);
     });
 
     it('does not add anything for a regular checkout where .git is a directory', () => {
