@@ -1,3 +1,4 @@
+import { readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import type { SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime';
@@ -10,6 +11,40 @@ function expandPath(pathValue: string, sessionPath: string): string {
     }
 
     return resolve(sessionPath, expandedHome);
+}
+
+/**
+ * A linked `git worktree` keeps its own gitdir (`.git/worktrees/<name>`) outside the
+ * worktree's own directory tree — `git add`/`fetch`/`commit` write index.lock, FETCH_HEAD,
+ * and refs there. Without this, those writes are outside every allowWrite root and fail
+ * with EPERM even though the session's own files are writable.
+ */
+function resolveGitWorktreeWritableRoot(sessionPath: string): string | undefined {
+    const gitPath = resolve(sessionPath, '.git');
+    let gitPathStat;
+    try {
+        gitPathStat = statSync(gitPath);
+    } catch {
+        return undefined;
+    }
+    if (!gitPathStat.isFile()) {
+        // A plain directory `.git` (main checkout) is already inside sessionPath.
+        return undefined;
+    }
+
+    const gitFileMatch = readFileSync(gitPath, 'utf8').match(/^gitdir:\s*(.+?)\s*$/m);
+    if (!gitFileMatch) {
+        return undefined;
+    }
+    const worktreeGitDir = isAbsolute(gitFileMatch[1]) ? gitFileMatch[1] : resolve(sessionPath, gitFileMatch[1]);
+
+    try {
+        const commonDirRelative = readFileSync(resolve(worktreeGitDir, 'commondir'), 'utf8').trim();
+        return isAbsolute(commonDirRelative) ? commonDirRelative : resolve(worktreeGitDir, commonDirRelative);
+    } catch {
+        // No commondir file — grant the per-worktree gitdir itself so plumbing still works.
+        return worktreeGitDir;
+    }
 }
 
 function resolvePaths(paths: string[], sessionPath: string): string[] {
@@ -76,22 +111,25 @@ export function buildSandboxRuntimeConfig(
 ): SandboxRuntimeConfig {
     const extraWritePaths = resolvePaths(sandboxConfig.extraWritePaths, sessionPath);
     const sharedAgentStatePaths = getSharedAgentStatePaths(sessionPath);
+    const gitWorktreeWritableRoot = resolveGitWorktreeWritableRoot(sessionPath);
+    const gitWorktreePaths = gitWorktreeWritableRoot ? [gitWorktreeWritableRoot] : [];
 
     const allowWrite = (() => {
         switch (sandboxConfig.sessionIsolation) {
             case 'strict':
-                return uniquePaths([resolve(sessionPath), ...extraWritePaths, ...sharedAgentStatePaths]);
+                return uniquePaths([resolve(sessionPath), ...extraWritePaths, ...sharedAgentStatePaths, ...gitWorktreePaths]);
             case 'workspace': {
                 const workspaceRoot = sandboxConfig.workspaceRoot
                     ? expandPath(sandboxConfig.workspaceRoot, sessionPath)
                     : resolve(sessionPath);
-                return uniquePaths([workspaceRoot, resolve(sessionPath), ...extraWritePaths, ...sharedAgentStatePaths]);
+                return uniquePaths([workspaceRoot, resolve(sessionPath), ...extraWritePaths, ...sharedAgentStatePaths, ...gitWorktreePaths]);
             }
             case 'custom':
                 return uniquePaths([
                     ...resolvePaths(sandboxConfig.customWritePaths, sessionPath),
                     ...extraWritePaths,
                     ...sharedAgentStatePaths,
+                    ...gitWorktreePaths,
                 ]);
         }
     })();

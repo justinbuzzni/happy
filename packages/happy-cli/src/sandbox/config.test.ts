@@ -1,6 +1,8 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { homedir } from 'node:os';
-import { isAbsolute, resolve } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { isAbsolute, join, resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import { buildSandboxRuntimeConfig, filterCredentialsFromEnv } from './config';
 import type { SandboxConfig } from '@/persistence';
 
@@ -183,6 +185,92 @@ describe('buildSandboxRuntimeConfig', () => {
         }
     });
 });
+
+describe('buildSandboxRuntimeConfig with a linked git worktree', () => {
+    const createdRoots: string[] = [];
+
+    afterEach(() => {
+        for (const root of createdRoots.splice(0)) {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    function createLinkedWorktree(): { worktreePath: string; commonGitDir: string } {
+        const root = mkdtempSync(join(tmpdir(), 'happy-sandbox-worktree-'));
+        createdRoots.push(root);
+
+        const mainRepo = join(root, 'main-repo');
+        const worktreePath = join(root, 'linked-worktree');
+        const commonGitDir = join(mainRepo, '.git');
+        const worktreeGitDir = join(commonGitDir, 'worktrees', 'linked-worktree');
+
+        mkdirSync(worktreeGitDir, { recursive: true });
+        mkdirSync(worktreePath, { recursive: true });
+        writeFileSync(join(worktreeGitDir, 'commondir'), '../..\n');
+        writeFileSync(join(worktreePath, '.git'), `gitdir: ${worktreeGitDir}\n`);
+
+        return { worktreePath, commonGitDir };
+    }
+
+    it('adds the resolved common gitdir to allowWrite so git add/fetch/commit can write index.lock, FETCH_HEAD, and refs', () => {
+        const { worktreePath, commonGitDir } = createLinkedWorktree();
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig(), worktreePath);
+
+        expect(runtimeConfig.filesystem?.allowWrite).toContain(commonGitDir);
+    });
+
+    it('falls back to the per-worktree gitdir when no commondir file exists', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happy-sandbox-worktree-'));
+        createdRoots.push(root);
+        const worktreePath = join(root, 'linked-worktree');
+        const worktreeGitDir = join(root, 'main-repo', '.git', 'worktrees', 'linked-worktree');
+        mkdirSync(worktreeGitDir, { recursive: true });
+        mkdirSync(worktreePath, { recursive: true });
+        writeFileSync(join(worktreePath, '.git'), `gitdir: ${worktreeGitDir}\n`);
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig(), worktreePath);
+
+        expect(runtimeConfig.filesystem?.allowWrite).toContain(worktreeGitDir);
+    });
+
+    it('does not add anything for a regular checkout where .git is a directory', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happy-sandbox-worktree-'));
+        createdRoots.push(root);
+        mkdirSync(join(root, '.git'), { recursive: true });
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig({ workspaceRoot: undefined }), root);
+
+        expect(runtimeConfig.filesystem?.allowWrite).toEqual([
+            resolve(root),
+            '/tmp',
+            ...expectedSharedAgentStatePathsFor(root),
+        ]);
+    });
+
+    it('does not throw and adds nothing when there is no .git at all', () => {
+        const root = mkdtempSync(join(tmpdir(), 'happy-sandbox-worktree-'));
+        createdRoots.push(root);
+
+        const runtimeConfig = buildSandboxRuntimeConfig(createConfig({ workspaceRoot: undefined }), root);
+
+        expect(runtimeConfig.filesystem?.allowWrite).toEqual([
+            resolve(root),
+            '/tmp',
+            ...expectedSharedAgentStatePathsFor(root),
+        ]);
+    });
+});
+
+function expectedSharedAgentStatePathsFor(sessionPathForTest: string): string[] {
+    const codexHome = process.env.CODEX_HOME || '~/.codex';
+    const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || '~/.claude';
+    const expand = (pathValue: string) => {
+        const expandedHome = pathValue.replace(/^~(?=\/|$)/, homedir());
+        return isAbsolute(expandedHome) ? expandedHome : resolve(sessionPathForTest, expandedHome);
+    };
+    return [...new Set([expand(codexHome), expand(claudeConfigDir)])];
+}
 
 describe('filterCredentialsFromEnv', () => {
     it('removes inherited GitHub and cloud credentials while preserving runtime variables', () => {
