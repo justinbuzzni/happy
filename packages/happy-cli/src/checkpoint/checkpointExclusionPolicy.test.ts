@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -178,6 +178,42 @@ describe('CheckpointExclusionGuard', () => {
             maxFiles: 100,
             maxTotalBytes: 4096,
         })).rejects.toThrow('ignored directory');
+    });
+
+    it('allows a narrow directory passthrough beneath an ignored ancestor', async () => {
+        await mkdir(join(projectPath, '.aplus', 'uploads'), { recursive: true });
+        await writeFile(join(projectPath, '.gitignore'), '.aplus/\n');
+
+        const guard = await CheckpointExclusionGuard.create({
+            projectPath,
+            secretPatterns: ['.env*'],
+            readOnlyPassthroughPaths: ['.aplus/uploads'],
+            maxFileBytes: 1024,
+            maxFiles: 100,
+            maxTotalBytes: 4096,
+        });
+
+        expect(guard.manifest.readOnlyPassthroughPaths).toEqual(['.aplus/uploads']);
+    });
+
+    it('rejects a narrow passthrough that escapes through an ignored symlink ancestor', async () => {
+        const outsider = await mkdtemp(join(tmpdir(), 'happy-checkpoint-policy-outsider-'));
+        try {
+            await mkdir(join(outsider, 'uploads'));
+            await symlink(outsider, join(projectPath, '.aplus'), 'dir');
+            await writeFile(join(projectPath, '.gitignore'), '.aplus/\n');
+
+            await expect(CheckpointExclusionGuard.create({
+                projectPath,
+                secretPatterns: ['.env*'],
+                readOnlyPassthroughPaths: ['.aplus/uploads'],
+                maxFileBytes: 1024,
+                maxFiles: 100,
+                maxTotalBytes: 4096,
+            })).rejects.toThrow('ignored directory');
+        } finally {
+            await rm(outsider, { recursive: true, force: true });
+        }
     });
 
     it.each(['/absolute', '../outside'])(

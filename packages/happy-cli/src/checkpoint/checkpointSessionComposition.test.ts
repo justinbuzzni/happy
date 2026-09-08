@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -79,6 +79,7 @@ describe('createCheckpointSessionComposition', () => {
             sandboxConfig,
             env: contextEnv(),
         })).rejects.toThrow('unsupported-platform');
+        await expect(lstat(join(projectPath, '.aplus'))).rejects.toThrow();
     });
 
     it('fails closed when a protected runtime has no durable event publisher', async () => {
@@ -90,6 +91,7 @@ describe('createCheckpointSessionComposition', () => {
             sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
             env: contextEnv(),
         })).rejects.toThrow('durable event publisher');
+        await expect(lstat(join(projectPath, '.aplus'))).rejects.toThrow();
     });
 
     it.each(['claude-remote', 'codex'] as const)(
@@ -347,5 +349,100 @@ describe('createCheckpointSessionComposition', () => {
         expect(result.beforeTurn).toBeUndefined();
         expect(result.sandboxConfig?.checkpointProtection).toBeUndefined();
         expect(result.sandboxConfig?.enabled).toBe(true);
+    });
+
+    it('exposes files written to .aplus/uploads/ before a turn through the provider path', async () => {
+        await writeFile(join(projectPath, '.gitignore'), '.aplus/\n');
+
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+
+        await mkdir(join(projectPath, '.aplus', 'uploads'), { recursive: true });
+        await writeFile(join(projectPath, '.aplus', 'uploads', 'attachment.txt'), 'uploaded content');
+        await writeFile(join(projectPath, '.aplus', '.env.production'), 'dummy-secret');
+
+        const turn = await result.beforeTurn?.();
+        if (!turn) throw new Error('expected turn preparation');
+
+        await expect(readFile(join(turn.providerPath, '.aplus', 'uploads', 'attachment.txt'), 'utf8'))
+            .resolves.toBe('uploaded content');
+        await expect(lstat(join(turn.providerPath, '.aplus', '.env.production'))).rejects.toThrow();
+    });
+
+    it('exposes .aplus/uploads through the provider path when the root gitignore never mentions .aplus', async () => {
+        await writeFile(join(projectPath, '.gitignore'), 'dist/\n');
+
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+
+        await writeFile(join(projectPath, '.aplus', 'uploads', 'attachment.txt'), 'narrow shape');
+
+        const turn = await result.beforeTurn?.();
+        if (!turn) throw new Error('expected turn preparation');
+
+        await expect(readFile(join(turn.providerPath, '.aplus', 'uploads', 'attachment.txt'), 'utf8'))
+            .resolves.toBe('narrow shape');
+    });
+
+    it('does not reject with policy drift when a file larger than maxFileBytes is uploaded after composition', async () => {
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+
+        const turn = await result.beforeTurn?.();
+        if (!turn || !result.completeTurn) throw new Error('expected protected turn lifecycle');
+
+        await result.completeTurn(async () => {});
+
+        await mkdir(join(projectPath, '.aplus', 'uploads'), { recursive: true });
+        const largeBuffer = Buffer.alloc(4096, 1);
+        await writeFile(join(projectPath, '.aplus', 'uploads', 'oversized.bin'), largeBuffer);
+
+        await expect(result.beforeTurn?.()).resolves.toBeDefined();
+    });
+
+    it('falls back to no passthrough when .aplus/.gitignore exists with tracked content', async () => {
+        await mkdir(join(projectPath, '.aplus'), { recursive: true });
+        await writeFile(join(projectPath, '.aplus', '.gitignore'), 'uploads/\n');
+        await writeFile(join(projectPath, '.aplus', 'tracked.txt'), 'keep me');
+
+        const result = await createCheckpointSessionComposition({
+            provider: 'codex',
+            platform: 'darwin',
+            projectPath,
+            sessionId: 'session-1',
+            sandboxConfig: SandboxConfigSchema.parse({ checkpointProtection: protection }),
+            env: contextEnv(),
+            checkpointEvents,
+        });
+
+        const turn = await result.beforeTurn?.();
+        if (!turn) throw new Error('expected turn preparation');
+
+        // No passthrough was registered, so the upload directory is absent from
+        // the workspace — but the project's own tracked file is still snapshotted.
+        await expect(lstat(join(turn.providerPath, '.aplus', 'uploads'))).rejects.toThrow();
+        await expect(readFile(join(turn.providerPath, '.aplus', 'tracked.txt'), 'utf8'))
+            .resolves.toBe('keep me');
     });
 });

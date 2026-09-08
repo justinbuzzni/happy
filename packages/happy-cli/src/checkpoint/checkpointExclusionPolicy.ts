@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
-import { join, relative, resolve, sep } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import ignore, { type Ignore } from 'ignore';
 import type { CheckpointEventDetail } from './checkpointContract';
 
@@ -149,9 +149,28 @@ async function buildCheckpointExclusionManifest(
         policy.readOnlyPassthroughPaths ?? [],
     );
     for (const path of readOnlyPassthroughPaths) {
-        const exclusion = excluded.find((entry) => entry.path === path);
-        const stats = await lstat(join(projectPath, path));
-        if (exclusion?.reason !== 'ignored' || !stats.isDirectory() || stats.isSymbolicLink()) {
+        const exclusion = excluded.find((entry) => (
+            entry.reason === 'ignored'
+            && (entry.path === path || path.startsWith(`${entry.path}/`))
+        ));
+        const absolutePath = join(projectPath, path);
+        const stats = await lstat(absolutePath);
+        const canonicalPath = await realpath(absolutePath);
+        const canonicalRelativePath = relative(projectPath, canonicalPath);
+        const exclusionStats = exclusion
+            ? await lstat(join(projectPath, exclusion.path))
+            : null;
+        if (
+            !exclusion
+            || !exclusionStats?.isDirectory()
+            || exclusionStats.isSymbolicLink()
+            || !stats.isDirectory()
+            || stats.isSymbolicLink()
+            || canonicalRelativePath === ''
+            || canonicalRelativePath === '..'
+            || canonicalRelativePath.startsWith(`..${sep}`)
+            || isAbsolute(canonicalRelativePath)
+        ) {
             throw new Error('checkpoint read-only passthrough must be an ignored directory');
         }
     }

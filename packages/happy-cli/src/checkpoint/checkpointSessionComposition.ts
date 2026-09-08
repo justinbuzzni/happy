@@ -7,7 +7,12 @@ import { buildSandboxRuntimeConfig } from '@/sandbox/config';
 import type { QueryOptions } from '@/claude/sdk';
 import { createCheckpointRuntime } from './checkpointRuntime';
 import { readCheckpointSpawnContext } from './checkpointSpawnContext';
-import { CheckpointPolicyDriftError, type CheckpointProvider } from './checkpointExclusionPolicy';
+import { checkpointAttachmentPassthroughCandidates } from './checkpointAttachmentPassthrough';
+import {
+    CheckpointPolicyDriftError,
+    resolveCheckpointProtectionCapability,
+    type CheckpointProvider,
+} from './checkpointExclusionPolicy';
 import type { CheckpointEventPublisher } from './checkpointEventPublisher';
 import { CheckpointProtectionStateStore } from './checkpointProtectionState';
 import { CheckpointTurnWorkspace } from './checkpointTurnWorkspace';
@@ -68,7 +73,15 @@ export async function createCheckpointSessionComposition(input: {
         const { checkpointProtection: _checkpointProtection, ...unprotectedSandbox } = inputSandboxConfig;
         return { sandboxConfig: unprotectedSandbox };
     }
-    const runtime = await createCheckpointRuntime({
+    const capability = resolveCheckpointProtectionCapability(input);
+    if (!capability.supported) {
+        throw new Error(`checkpoint protection unavailable: ${capability.reason}`);
+    }
+    const checkpointEvents = input.checkpointEvents;
+    if (!checkpointEvents) {
+        throw new Error('checkpoint protection requires a durable event publisher');
+    }
+    const buildRuntime = (passthroughPaths: string[] | undefined) => createCheckpointRuntime({
         provider: input.provider,
         platform: input.platform,
         projectPath: input.projectPath,
@@ -78,15 +91,34 @@ export async function createCheckpointSessionComposition(input: {
             projectId: context.projectId,
             worktreeId: context.worktreeId,
         },
-        protection,
+        protection: passthroughPaths
+            ? { ...protection, readOnlyPassthroughPaths: passthroughPaths }
+            : protection,
     });
+    // Expose the chat-attachment upload directory to the turn workspace. A
+    // passthrough is a convenience, never a gate: if no candidate can be
+    // prepared or the manifest rejects them all, the session must still start
+    // without one rather than fail closed on an attachment feature.
+    const attachmentCandidates = await checkpointAttachmentPassthroughCandidates(
+        canonicalProjectPath,
+    );
+    const runtime = await (async () => {
+        for (const candidate of attachmentCandidates) {
+            try {
+                return await buildRuntime([
+                    ...(protection.readOnlyPassthroughPaths ?? []),
+                    candidate,
+                ]);
+            } catch {
+                continue;
+            }
+        }
+        return buildRuntime(undefined);
+    })();
+
     if (runtime.status !== 'protected') {
         const reason = runtime.status === 'unavailable' ? runtime.reason : 'disabled';
         throw new Error(`checkpoint protection unavailable: ${reason}`);
-    }
-    const checkpointEvents = input.checkpointEvents;
-    if (!checkpointEvents) {
-        throw new Error('checkpoint protection requires a durable event publisher');
     }
 
     const turnWorkspace = new CheckpointTurnWorkspace(canonicalCheckpointRoot);
