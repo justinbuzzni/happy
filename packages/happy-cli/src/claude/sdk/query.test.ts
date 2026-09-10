@@ -16,6 +16,21 @@ describe('query adapter', () => {
         sdkQuery.mockClear();
     });
 
+    it('forwards the built-in tool allowance, including the empty list that disables them', () => {
+        query({ prompt: 'continue', options: { tools: [] } });
+        // 빈 배열은 "전부 끈다" 는 뜻이다. 여기서 흘리면 관리 실행의 도구 경계가
+        // SDK 까지 도달하지 못한다.
+        expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ tools: [] }),
+        }));
+
+        sdkQuery.mockClear();
+        query({ prompt: 'continue', options: { tools: ['Read'] } });
+        expect(sdkQuery).toHaveBeenCalledWith(expect.objectContaining({
+            options: expect.objectContaining({ tools: ['Read'] }),
+        }));
+    });
+
     it('forwards prompt suggestion enablement to the Claude Agent SDK', () => {
         query({
             prompt: 'continue',

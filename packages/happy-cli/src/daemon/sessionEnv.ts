@@ -144,3 +144,24 @@ export function buildResumedSessionSpawnEnvironment(input: {
         APLUS_SESSION_ID: input.sessionId,
     })
 }
+
+/**
+ * Sets or removes the confirmed-delivery switch on a **final** child
+ * environment.
+ *
+ * Applied after the merge because the daemon's own environment is inherited
+ * wholesale on the default path: deleting the key from the caller's extras is
+ * not enough, since a value already present in `process.env` would survive the
+ * merge and turn the switch on for a launch that never asked for it.
+ *
+ * The switch changes delivery behaviour only. It is not an identity and grants
+ * no permission.
+ */
+export function applyConfirmedPromptDeliveryFlag(
+    env: Record<string, string>,
+    required: boolean,
+): Record<string, string> {
+    if (required) return { ...env, HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' }
+    const { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: _removed, ...rest } = env
+    return rest
+}

@@ -45,6 +45,17 @@ interface LoopOptions {
     api: ApiClient,
     claudeEnvVars?: Record<string, string>
     claudeArgs?: string[]
+    /**
+     * A managed Cloud run loads no filesystem settings.
+     *
+     * A settings file's `env` block is applied to the agent and wins over the
+     * environment this startup produced, so `~/.claude/settings.json` on the
+     * runtime image could redirect the gateway or substitute a key after the
+     * approval was made. Managed runs load none of those sources.
+     */
+    managedSettingsLockdown?: boolean
+    /** A managed Cloud run: steering and goal-setting are refused. */
+    managedRun?: boolean
     messageQueue: MessageQueue2<EnhancedMode>
     allowedTools?: string[]
     sandboxConfig?: SandboxConfig
@@ -72,6 +83,8 @@ export async function loop(opts: LoopOptions): Promise<number> {
         sessionId: null,
         claudeEnvVars: opts.claudeEnvVars,
         claudeArgs: opts.claudeArgs,
+        managedSettingsLockdown: opts.managedSettingsLockdown,
+        managedRun: opts.managedRun,
         mcpServers: opts.mcpServers,
         mcpConfig: opts.mcpConfig,
         logPath: logPath,

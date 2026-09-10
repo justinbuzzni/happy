@@ -2,6 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import { register } from 'prom-client';
 import { rpcHandler } from './rpcHandler';
 
+// These cases are about the legacy relay, so the session is not a managed one.
+// The handler now asks the database that question before choosing a path, and
+// answering it here keeps these cases on the path they are written for.
+vi.mock('@/storage/db', () => ({
+    db: { managedSessionGrant: { findFirst: async () => null } },
+}));
+
 class FakeSocket {
     connected = true;
     timeoutCalls: number[] = [];

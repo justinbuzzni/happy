@@ -245,6 +245,15 @@ export interface SpawnSessionOptions {
      * session attaches to a forked Codex app-server thread.
      */
     resumeCodexThreadId?: string;
+    /**
+     * The managed Cloud spawn envelope (specs/managed-cloud-byos §5.33).
+     *
+     * Accepted only from a verified managed dispatch on a runtime whose own
+     * identity is active; a caller cannot turn managed mode on by supplying
+     * this, and supplying it does not relax any of the ordinary guards.
+     */
+    bootstrap?: unknown;
+    gateway?: unknown;
     /** Happy session id this fork was branched from (lineage). */
     parentSessionId?: string;
     /** Happy message id used as the rewind point (only set for "duplicate"). */
@@ -278,6 +287,13 @@ export interface SpawnSessionOptions {
     saycodePromptBlocks?: Record<string, boolean>;
     /** Exit cleanly after the spawned agent completes its first turn. */
     exitAfterFirstTurn?: boolean;
+    /**
+     * Internal only. Set by the daemon's managed dispatch wrapper, never read
+     * from RPC params — a caller that supplied it would be choosing its own
+     * delivery guarantees. Turns on confirmed delivery of the initial prompt
+     * and nothing else; it conveys no identity or permission.
+     */
+    requireInitialPromptAck?: boolean;
     /** Remove inherited daemon credentials before applying the explicit spawn environment. */
     filterInheritedCredentials?: boolean;
     /** Restrict an unattended automation session to repository reads. */

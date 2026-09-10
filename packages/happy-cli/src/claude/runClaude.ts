@@ -53,7 +53,11 @@ import { join } from 'node:path';
 import { RawJSONLinesSchema, type RawJSONLines } from './types';
 import { installBroadKillShims } from '@/utils/broadKillShims';
 import { readReconnectSessionEnvironment } from '@/daemon/reconnectSessionEnv';
-import { deliverPreparedClaudeSessionStart, prepareClaudeInitialPrompt } from './initialPrompt';
+import {
+    assertClaudeConfirmedDeliveryPossible,
+    deliverPreparedClaudeSessionStart,
+    prepareClaudeInitialPrompt,
+} from './initialPrompt';
 import { mergeReconnectSessionMetadata } from '@/utils/reconnectSessionMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
@@ -65,6 +69,15 @@ import {
 } from '@/prompt/promptProvenance';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
+import { requireAccountToken, type ManagedStartup } from '@/managed/managedStartup';
+import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, requireAccountMachineId, stripAgentModelArguments, stripProviderCredentialOverrides } from '@/managed/managedStartup';
+
+/**
+ * How long a confirmed initial prompt waits for its acknowledgement before the
+ * launch is refused. Long enough to ride a slow flush, short enough that a run
+ * does not hang on a server that will not answer.
+ */
+const INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -94,7 +107,48 @@ type PendingClaudeGoalAction = {
     timeout: ReturnType<typeof setTimeout>;
 };
 
-export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
+/**
+ * Who this run acts for.
+ *
+ * A managed run has no account: it was handed a session and a bearer scoped to
+ * it. Spelling that as a union rather than a `Credentials` with empty fields
+ * keeps account-only work — MCP caller grants, the aplus config fetch — from
+ * compiling against a principal that cannot serve it.
+ */
+export type RunnerPrincipal =
+    | { kind: 'account'; credentials: Credentials }
+    | { kind: 'managed'; startup: ManagedStartup };
+
+export async function runClaude(principal: RunnerPrincipal, options: StartOptions = {}): Promise<void> {
+    const managedStartup = principal.kind === 'managed' ? principal.startup : null;
+    const accountToken = principal.kind === 'account' ? principal.credentials.token : null;
+    if (principal.kind === 'managed') {
+        const envelope = principal.startup.envelope;
+        // The real working directory, not the displayed one: the agent reads
+        // and writes relative to this.
+        assertManagedWorkingDirectory(process.cwd());
+        // Before the reconnect environment is read, which happens within a few
+        // lines and would otherwise resume a session this run has nothing to
+        // do with — dropping its prompt on the way.
+        clearForeignSessionLineage(process.env);
+        // The approved gateway is the only route to a provider, and the
+        // capability the only credential this run may spend.
+        applyManagedGatewayEnvironment(process.env, envelope);
+        // The verified envelope is the authority for this run. Anything the
+        // caller put on the command line describes a different run: the model
+        // and effort were priced and approved upstream, and the prompt is the
+        // one the run was created for. Overriding either here would bill one
+        // model while running another, or answer a prompt nobody asked.
+        options = {
+            ...options,
+            model: envelope.model,
+            claudeArgs: stripAgentModelArguments(options.claudeArgs),
+            // Written into `process.env` after this point, so they would
+            // otherwise replace the gateway that was just set.
+            claudeEnvVars: stripProviderCredentialOverrides(options.claudeEnvVars),
+        };
+        applyManagedInitialPrompt(process.env, envelope);
+    }
     logger.debug(`[CLAUDE] ===== CLAUDE MODE STARTING =====`);
     logger.debug(`[CLAUDE] This is the Claude agent, NOT Gemini`);
 
@@ -119,7 +173,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     connectionState.setBackend('Claude');
 
     // Create session service
-    const api = await ApiClient.create(credentials);
+    // A managed client cannot create a session, register a machine, or reach
+    // the account push endpoints — the refusals live in the client itself
+    // rather than in every caller.
+    const api = principal.kind === 'managed'
+        ? ApiClient.managed(principal.startup.attachment)
+        : await ApiClient.create(principal.credentials);
 
     // Create a new session
     let state: AgentState = {};
@@ -144,17 +203,23 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         initialPermissionMode === 'yolo' ||
         sandboxEnabled ||
         Boolean(options.claudeArgs?.includes('--dangerously-skip-permissions'));
-    if (!machineId) {
+    // A managed child has no local account home and therefore no machine id in
+    // settings — it was never registered as a machine and does not need to be.
+    // Requiring one would refuse to start the very runs this branch exists for.
+    if (!machineId && !managedStartup) {
         console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
 
-    // Create machine if it doesn't exist
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    // Create machine if it doesn't exist. A managed child has no machine of
+    // its own: the runtime it runs inside is the registered thing.
+    if (!managedStartup) {
+        await api.getOrCreateMachine({
+            machineId: requireAccountMachineId(machineId),
+            metadata: initialMachineMetadata
+        });
+    }
 
     // Lineage from the daemon's spawn RPC (set by app-side fork / duplicate).
     const forkedFromSessionId = process.env.HAPPY_FORKED_FROM_SESSION_ID;
@@ -165,7 +230,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     const { metadata: freshMetadata } = createSessionMetadata({
         flavor: 'claude',
-        machineId,
+        // A managed run has no machine of its own, and this locally built
+        // document is discarded for it: the session metadata comes from the
+        // server, opened with the key this process was handed.
+        machineId: machineId ?? '',
         startedBy: options.startedBy,
         sandbox: sandboxConfig,
         dangerouslySkipPermissions,
@@ -191,7 +259,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn;
 
     let response: ApiSession | null;
-    if (reconnectSession) {
+    if (managedStartup) {
+        // Already looked up, already proven to belong to the key this process
+        // was given, and already placed on the runtime's own project root —
+        // settled before anything can register handlers against the path.
+        response = managedStartup.attachment.session;
+    } else if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
             ...reconnectSession,
@@ -201,6 +274,14 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
+
+    // A launch that requires confirmed delivery has nothing to confirm against
+    // without a server session, and the offline branch below never reaches the
+    // prepared-start helper that would otherwise catch it.
+    assertClaudeConfirmedDeliveryPossible({
+        prepared: preparedInitialPrompt,
+        serverAvailable: response !== null,
+    });
 
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
@@ -292,7 +373,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
     const checkpointEvents = sandboxConfig?.checkpointProtection
         ? createCheckpointEventPublisher({
-            token: credentials.token,
+            token: requireAccountToken(accountToken),
             sessionId: response.id,
             encryption: {
                 encryptionKey: response.encryptionKey,
@@ -641,6 +722,17 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         if (!command) {
             throw new Error('Unsupported Claude goal action');
         }
+        if (managedStartup && command.type === 'set') {
+            // A managed run answers exactly the prompt its envelope was admitted
+        // for. Steering and setting a goal are free-text instructions that
+        // reach the provider outside that admission — steering is injected
+        // into the turn already running, and a goal is carried into every turn
+        // after it. Refused before the provider or the queue is touched;
+        // clearing a goal removes an instruction rather than adding one, so it
+        // stays. Permission answers are bound to a request this run is already
+        // waiting on and are untouched.
+            throw new Error('A managed run cannot be given a new objective');
+        }
         if (pendingClaudeGoalAction) {
             throw new Error('Claude goal action already in progress');
         }
@@ -721,6 +813,21 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     session.onUserMessage(async (message) => {
+        // A managed run answers exactly the prompt its envelope was admitted
+        // for. A message posted to this session by the account owner arrives
+        // here as an ordinary user turn: it would change the model, the
+        // permission mode and the system prompt, then queue another turn —
+        // spending this run's capability on work that passed no admission and
+        // silently replacing the selection that was priced. Refused before any
+        // of that happens; a new prompt needs a new run.
+        //
+        // This is the general free-text path only. Permission answers and tool
+        // responses arrive as their own RPCs, bound to an approval this run is
+        // already waiting on, and are untouched.
+        if (managedStartup) {
+            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
+            return;
+        }
 
         // Stamp the prompt so the remote-mode JSONL scanner can dedupe
         // it later — the SDK is about to write this same text to disk
@@ -977,6 +1084,15 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // a reconnect resumes an existing conversation.
     await deliverPreparedClaudeSessionStart({
         prepared: preparedInitialPrompt,
+        // Only when the daemon asked for it. On every other launch this is
+        // undefined and delivery behaves exactly as it always has.
+        ...(preparedInitialPrompt.requireConfirmedDelivery
+            ? {
+                confirmDelivery: (localId: string) => session.awaitMessageAck(
+                    localId, INITIAL_PROMPT_ACK_TIMEOUT_MS,
+                ),
+            }
+            : {}),
         sink: {
             sessionId: session.sessionId,
             hasTitle: () => session.hasTitle(),
@@ -1123,13 +1239,15 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // P6(b): aplus 자동 mcp 등록 — web-ui 의 /api/me/mcp-config 응답을
     // 'happy' MCP 옆에 머지한다. 실패는 silent (graceful degrade).
-    const initialAplusMcpSnapshot = await fetchAplusMcpConfigSnapshot(
-        credentials.token,
-        machineId,
+    // Account-only: the aplus MCP config belongs to a user, and a managed run
+    // has none. Skipped rather than attempted with a scoped bearer.
+    const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
+        accountToken,
+        requireAccountMachineId(machineId),
         { sessionId: session.sessionId },
     );
-    const initialAplusMcpResult = initialAplusMcpSnapshot.result;
-    for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
+    const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
+    for (const status of initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : []) {
         session.updateMetadata((currentMetadata) => ({
             ...currentMetadata,
             mcpServers: [
@@ -1138,7 +1256,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             ],
         }));
     }
-    const aplusMcpServers = initialAplusMcpSnapshot.servers;
+    const aplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
     const baseMcpServers = {
         'happy': {
             type: 'http' as const,
@@ -1180,16 +1298,20 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             fetchAplusServers: async () => {
                 // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
                 // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
-                await refreshMcpCallerGrantIfExpiring(credentials.token, machineId);
+                const token = requireAccountToken(accountToken);
+                const account = requireAccountMachineId(machineId);
+                await refreshMcpCallerGrantIfExpiring(token, account);
                 return fetchAplusMcpServersResult(
-                    credentials.token,
-                    machineId,
+                    token,
+                    account,
                     { sessionId: session.sessionId, lifecycle: 'turn' },
                 );
             },
         },
         session,
         claudeEnvVars: options.claudeEnvVars,
+        managedSettingsLockdown: managedStartup !== null,
+        managedRun: managedStartup !== null,
         claudeArgs: options.claudeArgs,
         sandboxConfig: checkpointComposition.sandboxConfig,
         checkpointComposition,

@@ -18,7 +18,7 @@ import { accessKeysRoutes } from "./routes/accessKeysRoutes";
 import { machineSessionOwnerRoutes } from "./routes/machineSessionOwnerRoutes";
 import { enableMonitoring } from "./utils/enableMonitoring";
 import { enableErrorHandlers } from "./utils/enableErrorHandlers";
-import { enableAuthentication } from "./utils/enableAuthentication";
+import { enableAuthentication, enableSessionScopeAuthentication } from "./utils/enableAuthentication";
 import { userRoutes } from "./routes/userRoutes";
 import { feedRoutes } from "./routes/feedRoutes";
 import { internalFeedRoutes } from "./routes/internalFeedRoutes";
@@ -39,7 +39,16 @@ import { scriptAutomationRoutes } from "./routes/scriptAutomationRoutes";
 import { startScriptInvocationMaintenance } from "@/app/automation/scriptInvocationMaintenance";
 import { sessionFollowupRoutes } from "./routes/sessionFollowupRoutes";
 import { agentProfileRoutes } from "./routes/agentProfileRoutes";
-import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
+import { managedControlRoutes } from "./routes/managedControlRoutes";
+import { managedApprovalRoutes } from "@/app/api/routes/managedApprovalRoutes";
+import { managedDaemonRenewRoutes } from '@/app/api/routes/managedDaemonRenewRoutes';
+import { createManagedControlRuntime, type ManagedControlRuntime } from "@/app/managed/managedControlRuntime";
+import {
+    activateManagedStorage,
+    assertPrivateRootIsolated,
+    setManagedBucket,
+} from "@/app/managed/managedAttachmentStorage";
+import { isLocalStorage, getLocalFilesDir, getManagedFilesDir } from "@/storage/files";
 import * as path from "path";
 import * as fs from "fs";
 import { startUsageOutboxWorker } from "@/app/usage/usageOutbox";
@@ -142,7 +151,25 @@ export async function startApi(opts: StartApiOptions = {}) {
         });
     }
 
+    // Managed control is off unless the deployment configures verification
+    // keys; `createManagedControlRuntime` returns null when it has not, and the
+    // routes then refuse rather than falling back to the account bearer.
+    const managedControl: ManagedControlRuntime | null = await createManagedControlRuntime(process.env);
+
+    // The one configured issuer, handed to the session-data decorator. Building
+    // a second here would verify against a second key.
+    enableSessionScopeAuthentication(typed, () => managedControl?.scopedTokens ?? null);
+
     // Routes
+    managedControlRoutes(typed, () => managedControl);
+    // The credential-recovery half of the same control plane: it extends or
+    // re-reads a daemon grant that already exists and never touches machine key
+    // material, so it is signed for under its own operations.
+    managedDaemonRenewRoutes(typed, () => managedControl);
+    // Answering a permission prompt from a browser. It needs the session-scope
+    // decorator enabled above, and nothing from the control runtime: the
+    // bearer it accepts is a managed one, not a control-plane assertion.
+    managedApprovalRoutes(typed);
     authRoutes(typed);
     pushRoutes(typed);
     sessionRoutes(typed);
@@ -168,7 +195,26 @@ export async function startApi(opts: StartApiOptions = {}) {
     workspaceRoutes(typed);
     mergeRequestRoutes(typed);
     previewRoutes(typed);
-    attachmentRoutes(typed);
+    // The same initialized runtime the scoped-token decorator uses. Building a
+    // second here would derive a second key and publish a second origin.
+    //
+    // Storage is a separate gate: the relay only runs once the private root is
+    // provably distinct from the public one, and — on an object store — the
+    // managed bucket has been seen to carry no policy at all. Anything less
+    // than that leaves the relay off rather than pointed somewhere public.
+    let managedStorageReady = false;
+    if (managedControl) {
+        assertPrivateRootIsolated(getLocalFilesDir(), getManagedFilesDir());
+        const activation = await activateManagedStorage(process.env);
+        if (activation.ok) {
+            managedStorageReady = true;
+            setManagedBucket(activation.mode === 's3' ? activation.bucket : null);
+        } else {
+            log({ module: 'managed-attachments', level: 'error' },
+                `Managed attachment storage inactive (${activation.reason})`);
+        }
+    }
+    attachmentRoutes(typed, () => (managedStorageReady ? managedControl : null));
     automationRoutes(typed);
     scriptAutomationRoutes(typed);
     sessionFollowupRoutes(typed);
@@ -241,7 +287,7 @@ export async function startApi(opts: StartApiOptions = {}) {
     });
 
     // Start Socket
-    startSocket(typed);
+    startSocket(typed, managedControl);
 
     // Preview WebSocket relay — must attach after startSocket so engine.io's
     // upgrade listener is already in place (they coexist on app.server; see

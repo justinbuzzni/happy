@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiSessionClient, toolCallStartLaunchesBackgroundJob } from './apiSession';
+import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
@@ -2258,6 +2259,153 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockSocket.close).toHaveBeenCalledTimes(1);
         expect(mockAxiosGet).not.toHaveBeenCalled();
         expect(mockAxiosPost).not.toHaveBeenCalled();
+    });
+
+    describe('managed durable message acknowledgement', () => {
+        /**
+         * The confirmation rides the existing outbox: a caller registers a waiter,
+         * enqueues through the normal path, and awaits. Nothing here bypasses
+         * `pendingOutbox`, so ordering against fork backfill is untouched.
+         */
+        function ackRow(localId: string, over: Partial<{ id: string; seq: number }> = {}) {
+            return { id: 'msg-1', seq: 1, localId, createdAt: 1, updatedAt: 1, ...over };
+        }
+
+        it('confirms once the server returns a matching acknowledgement', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('local-initial')] } });
+
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('hi', 'sess-1'), 'local-initial');
+
+            await expect(wait).resolves.toMatchObject({ ok: true, id: 'msg-1', seq: 1 });
+        });
+
+        it('accepts an acknowledgement for a row the server already had', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            // Server-side dedupe returns the pre-existing row; that is a real ack.
+            mockAxiosPost.mockResolvedValue({
+                data: { messages: [ackRow('local-initial', { id: 'existing-1', seq: 7 })] }
+            });
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('hi', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: true, id: 'existing-1', seq: 7 });
+        });
+
+        it('does not confirm on a 2xx that omits our acknowledgement', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [] } });
+
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('hi', 'sess-1'), 'local-initial');
+
+            // Not proof the message was lost — durability is simply unknown.
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'deadline' });
+        });
+
+        it.each([
+            ['a missing id', { id: '' }],
+            ['a non-integer seq', { seq: 1.5 }],
+            ['a zero seq', { seq: 0 }],
+            ['a negative seq', { seq: -3 }],
+            ['an unsafe seq', { seq: Number.MAX_SAFE_INTEGER + 2 }],
+        ])('does not confirm on %s', async (_name, over) => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('local-initial', over)] } });
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false });
+        });
+
+        it('ignores an acknowledgement for a different localId', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('someone-else')] } });
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'deadline' });
+        });
+
+        it('refuses contradictory duplicate acknowledgements for one localId', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({
+                data: {
+                    messages: [
+                        ackRow('local-initial', { id: 'msg-a', seq: 1 }),
+                        ackRow('local-initial', { id: 'msg-b', seq: 2 }),
+                    ]
+                }
+            });
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'contradictory-ack' });
+        });
+
+        it('reports unknown when the post keeps failing', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockRejectedValue(new Error('network down'));
+            const wait = client.awaitMessageAck('local-initial', 30);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await expect(wait).resolves.toMatchObject({ ok: false });
+        });
+
+        it('resolves every pending waiter as unknown when the session closes', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockImplementation(() => new Promise(() => {}));
+            const wait = client.awaitMessageAck('local-initial', 10_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await client.close();
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'closed' });
+        });
+
+        it('refuses a second waiter for the same localId', () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const first = client.awaitMessageAck('local-initial', 50);
+            expect(() => client.awaitMessageAck('local-initial', 50)).toThrowError(/already/);
+            return expect(first).resolves.toMatchObject({ ok: false });
+        });
+
+        it('keeps ordering: a backfilled queue is posted before the confirmed message', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const posted: string[][] = [];
+            mockAxiosPost.mockImplementation(async (_url: string, payload: { messages: Array<{ localId: string }> }) => {
+                posted.push(payload.messages.map((m) => m.localId));
+                return { data: { messages: payload.messages.map((m, i) => ackRow(m.localId, { id: `id-${i}`, seq: posted.length * 10 + i + 1 })) } };
+            });
+
+            // Stands in for FORK BACKFILL: a historical transcript enqueued before
+            // the initial prompt ever runs.
+            for (let i = 0; i < 3; i += 1) client.sendCodexMessage({ type: `backfill-${i}` });
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+
+            await expect(wait).resolves.toMatchObject({ ok: true });
+            const flat = posted.flat();
+            // The confirmed message must not have jumped the queue.
+            expect(flat[flat.length - 1]).toBe('local-initial');
+            expect(flat.length).toBe(4);
+        });
+
+            it('ignores an acknowledgement that names a localId this batch did not carry', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            // An earlier batch's response naming an unrelated localId must not
+            // confirm a message that has not even been posted yet.
+            mockAxiosPost.mockResolvedValueOnce({
+                data: { messages: [ackRow('local-initial', { id: 'stray', seq: 99 })] }
+            });
+            client.sendCodexMessage({ type: 'backfill' });
+            const wait = client.awaitMessageAck('local-initial', 40);
+            await expect(wait).resolves.toMatchObject({ ok: false, reason: 'deadline' });
+        });
+
+    it('leaves no pending waiter state behind', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            mockAxiosPost.mockResolvedValue({ data: { messages: [ackRow('local-initial')] } });
+            const wait = client.awaitMessageAck('local-initial', 1_000);
+            client.sendClaudeSessionMessage(buildInitialPromptUserRecord('x', 'sess-1'), 'local-initial');
+            await wait;
+            // Re-registering proves the previous entry was cleaned up.
+            expect(() => client.awaitMessageAck('local-initial', 10)).not.toThrow();
+        });
     });
 });
 

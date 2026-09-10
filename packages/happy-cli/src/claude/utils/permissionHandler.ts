@@ -12,6 +12,19 @@ import { EnhancedMode, PermissionMode } from "../loop";
 import { getToolDescriptor } from "./getToolDescriptor";
 import { mapToClaudeMode } from "./permissionMode";
 
+/**
+ * What the child says it did with an answer.
+ *
+ * Returned through the ordinary RPC path, which seals it with the session key —
+ * so the browser that sent the answer can read it and nothing in between can.
+ * Older clients ignore the body, which is what they did when it was `undefined`.
+ */
+export interface PermissionAck {
+    applied: boolean;
+    /** Why not, when it was not. */
+    reason?: 'unknown-request' | 'already-answered';
+}
+
 interface PermissionResponse {
     id: string;
     approved: boolean;
@@ -352,7 +365,7 @@ export class PermissionHandler {
      * Sets up the client handler for permission responses
      */
     private setupClientHandler(): void {
-        this.session.client.rpcHandlerManager.registerHandler<PermissionResponse, void>('permission', async (message) => {
+        this.session.client.rpcHandlerManager.registerHandler<PermissionResponse, PermissionAck>('permission', async (message) => {
             logger.debugLargeJson('Permission response:', message);
 
             const id = message.id;
@@ -360,7 +373,24 @@ export class PermissionHandler {
 
             if (!pending) {
                 logger.debug('Permission request not found or already resolved');
-                return;
+                /*
+                 * Answered, and answered with what happened.
+                 *
+                 * This used to return nothing, which the RPC layer encrypts and
+                 * returns exactly as it returns a success — so a caller could
+                 * not tell "the run acted on this" from "nobody was waiting for
+                 * it". Everything between here and the browser is a relay: the
+                 * server holds no key to this session and cannot inspect the
+                 * answer, so the only place this fact can be stated is here,
+                 * inside the sealed response.
+                 *
+                 * Which of the two it was matters to the person: a request that
+                 * was already answered is a stale tab, and one nobody knows
+                 * about is a prompt that has gone.
+                 */
+                return this.responses.has(id)
+                    ? { applied: false, reason: 'already-answered' }
+                    : { applied: false, reason: 'unknown-request' };
             }
 
             // Store the response with timestamp
@@ -392,6 +422,7 @@ export class PermissionHandler {
                     }
                 };
             });
+            return { applied: true };
         });
     }
 

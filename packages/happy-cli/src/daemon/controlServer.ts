@@ -19,6 +19,69 @@ import { startServerProcess, StartServerError } from './startServer';
 import { stopServerProcess, StopServerError } from './stopServer';
 import { BrowserBridge, BridgeRequestError } from './browserBridge';
 import { attachTerminalWsRoute, type MachineEncryption as TerminalMachineEncryption } from './controlServerTerminalWs';
+
+/**
+ * The only control-server paths a managed runtime may serve, and even these
+ * are not open on the shared bearer alone.
+ *
+ * The bearer secret is loopback-wide: on a managed runtime the agent's own
+ * tools can read it, so it proves "something on this host" and nothing about
+ * *which* launch is reporting. A report accepted on that basis lets arbitrary
+ * code forge another Run's session id. Each report is therefore additionally
+ * checked against the launch registry by `verifyManagedReport`, and when no
+ * verifier is wired — the current state, since T09 owns the launcher — the
+ * path is refused rather than opened.
+ *
+ * `/stop` is deliberately absent: shutting the daemon down would also kill the
+ * lease watchdog, and that authority does not belong with report authority.
+ *
+ * On a managed runtime these paths do **not** take the daemon-wide bearer at
+ * all: the child never receives that secret, and requiring it would mean
+ * handing it over. The per-launch capability is the only credential here.
+ */
+const MANAGED_REPORT_PATHS = new Set(['/session-started', '/session-runtime']);
+
+/**
+ * What a managed lifecycle report claims, taken from the parsed body.
+ *
+ * The verifier must see this, not just the path and headers: a launch token in
+ * a header says which launch is speaking, while the body says which session is
+ * being reported, and checking only the former lets launch A report a session
+ * that belongs to B. The `kind` is passed so each report type can be validated
+ * on its own terms rather than through one catch-all check.
+ *
+ * The whole parsed body travels with the claim because `sessionId` alone is not
+ * the whole assertion. `metadata.hostPid` on a session-started report and
+ * `hostPid` on a runtime report both steer which process the daemon adopts
+ * (`run.ts` webhook and runtime handlers), so a registry that only saw the
+ * session id could not tell a correct report from one that keeps the session
+ * and swaps the process. Encryption scope is included for the same reason.
+ */
+export type ManagedReportClaim =
+    | {
+        kind: 'session-started';
+        sessionId: string;
+        headers: Record<string, unknown>;
+        /** Whole parsed body. `metadata.hostPid` steers session adoption. */
+        report: {
+            sessionId: string;
+            metadata: unknown;
+            encryption?: {
+                encryptionKey: string;
+                encryptionVariant: 'legacy' | 'dataKey';
+                seq: number;
+                metadataVersion: number;
+                agentStateVersion: number;
+            };
+        };
+    }
+    | {
+        kind: 'session-runtime';
+        sessionId: string;
+        headers: Record<string, unknown>;
+        /** Whole parsed body. `hostPid` adopts an untracked process. */
+        report: Record<string, unknown>;
+    };
 import type { ChildProcess } from 'node:child_process';
 import { homedir } from 'node:os';
 
@@ -32,7 +95,9 @@ export function startDaemonControlServer({
   portRegistry,
   browserBridge,
   allowedRoot = homedir(),
-  getMachineEncryption = () => null
+  getMachineEncryption = () => null,
+  managedRuntime = false,
+  verifyManagedReport,
 }: {
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string, context?: StopSessionContext) => StopSessionResult;
@@ -59,11 +124,39 @@ export function startDaemonControlServer({
    *  callers that don't wire this up (most tests, `preflightDaemonControlServer`)
    *  don't have to. */
   getMachineEncryption?: () => TerminalMachineEncryption | null;
+  /** True on a verified managed runtime — closes the loopback spawn path. */
+  managedRuntime?: boolean;
+  /**
+   * Checks a managed lifecycle report against the trusted launch registry.
+   * Absent means no launcher is wired, and managed reports are then refused.
+   */
+  verifyManagedReport?: (input: ManagedReportClaim) =>
+    Promise<{ ok: true } | { ok: false; reason: string }>;
 }): Promise<{ port: number; stop: () => Promise<void>; controlSecret: string }> {
   return new Promise((resolve) => {
     const app = fastify({
       logger: false // We use our own logger
     });
+
+    /**
+     * Refuses a managed lifecycle report that no launch verifier vouched for.
+     *
+     * Returns a value when the request was refused so the route can `return` it;
+     * `null` means the report may proceed. On a BYOS daemon this is inert.
+     */
+    const refuseUnverifiedManagedReport = async (
+      claim: ManagedReportClaim,
+    ): Promise<{ error: string; code: string } | null> => {
+      if (!managedRuntime) return null;
+      const verified = verifyManagedReport
+        ? await verifyManagedReport(claim)
+        : { ok: false as const, reason: 'no-launch-verifier' };
+      if (verified.ok) return null;
+      return {
+        error: `managed report rejected (${verified.reason})`,
+        code: 'MANAGED_LAUNCH_SCOPE_REQUIRED',
+      };
+    };
 
     // Loopback-only Bearer secret (ADR-061, specs/desktop-speed-breakthrough-
     // local-direct). This server binds 127.0.0.1 only, but loopback is shared
@@ -74,6 +167,26 @@ export function startDaemonControlServer({
     // authenticate, so there is no bootstrap chicken-and-egg to work around.
     const controlSecret = encodeBase64Url(getRandomBytes(32));
     app.addHook('onRequest', async (request, reply) => {
+      // On a managed runtime this loopback server is reachable by the agent's
+      // own tools, so only the reports the daemon genuinely needs stay open.
+      // Everything else here — spawn, stop, shell (`/start-server`), the HTTP
+      // and browser proxies — would be an unsigned path to start or influence
+      // work, which is what the managed dispatch RPCs exist to prevent.
+      if (managedRuntime) {
+        const path = new URL(request.url, 'http://127.0.0.1').pathname;
+        if (!MANAGED_REPORT_PATHS.has(path)) {
+          await reply.code(403).send({
+            error: 'control endpoint is not available on a managed runtime',
+            code: 'MANAGED_CAPABILITY_REQUIRED',
+          });
+          return;
+        }
+        // 보고 경로는 여기서 통과시키고, 각 라우트가 per-launch capability 로
+        // 판정한다. daemon 전역 secret 을 요구하면 그 값을 child 에게 줘야 하고,
+        // 그러면 agent 의 도구가 읽어 다른 Run 의 세션을 위조할 수 있다.
+        // 통과가 곧 허용은 아니다 — verifier 가 없으면 라우트가 거부한다.
+        return;
+      }
       if (request.headers.authorization !== `Bearer ${controlSecret}`) {
         await reply.code(401).send({ error: 'unauthorized' });
       }
@@ -82,7 +195,9 @@ export function startDaemonControlServer({
     // Same secret, same loopback trust boundary — but a WS upgrade never goes
     // through Fastify's route handlers/hooks above, so it needs its own check
     // at `verifyClient` (attachTerminalWsRoute).
-    const terminalWs = attachTerminalWsRoute(app.server, {
+    // The terminal WebSocket is a shell into the runtime and bypasses the RPC
+    // dispatch gate entirely, so a managed runtime does not attach it at all.
+    const terminalWs = managedRuntime ? null : attachTerminalWsRoute(app.server, {
       path: '/terminal',
       controlSecret,
       allowedRoot,
@@ -111,11 +226,28 @@ export function startDaemonControlServer({
         response: {
           200: z.object({
             status: z.literal('ok')
+          }),
+          403: z.object({
+            error: z.string(),
+            code: z.string(),
           })
         }
       }
-    }, async (request) => {
+    }, async (request, reply) => {
       const { sessionId, metadata, encryption } = request.body;
+
+      // Checked after parsing so the claim carries the session the body names,
+      // not just the launch the header names.
+      const refusal = await refuseUnverifiedManagedReport({
+        kind: 'session-started',
+        sessionId,
+        headers: request.headers as Record<string, unknown>,
+        report: { sessionId, metadata, ...(encryption ? { encryption } : {}) },
+      });
+      if (refusal) {
+        reply.code(403);
+        return refusal;
+      }
 
       logger.debug(`[CONTROL SERVER] Session started: ${sessionId}`);
 
@@ -157,11 +289,26 @@ export function startDaemonControlServer({
         response: {
           200: z.object({
             status: z.literal('ok')
+          }),
+          403: z.object({
+            error: z.string(),
+            code: z.string(),
           })
         }
       }
-    }, async (request) => {
+    }, async (request, reply) => {
       const { sessionId, reportSeq, thinking, hasOpenToolCall, pendingUserInput, lastUserInteractionAt, lastTurnEndAt, assistantTurns, providerTokens, launchedBackgroundJob, lastProcessedSeq, mode, hostPid } = request.body;
+
+      const refusal = await refuseUnverifiedManagedReport({
+        kind: 'session-runtime',
+        sessionId,
+        headers: request.headers as Record<string, unknown>,
+        report: request.body as Record<string, unknown>,
+      });
+      if (refusal) {
+        reply.code(403);
+        return refusal;
+      }
 
       onHappySessionRuntime(sessionId, {
         ...(reportSeq !== undefined ? { reportSeq } : {}),
@@ -297,6 +444,16 @@ export function startDaemonControlServer({
       } = request.body;
 
       logger.debug(`[CONTROL SERVER] Spawn session request: dir=${directory}, sessionId=${sessionId || 'new'}, agent=${agent || 'default'}, hasUserCreds=${!!(happyToken && happySecret)}`);
+      // The loopback control server is reachable by any code running inside the
+      // runtime, including the agent's own tools. On a managed runtime that
+      // would be an unsigned path to start work, so it is closed here.
+      if (managedRuntime) {
+        reply.code(500);
+        return {
+          success: false,
+          error: 'spawn-session is not available on a managed runtime; use the managed dispatch RPCs',
+        };
+      }
       const result = await spawnSession({
         directory,
         sessionId,
@@ -726,7 +883,7 @@ export function startDaemonControlServer({
         controlSecret,
         stop: async () => {
           logger.debug('[CONTROL SERVER] Stopping server');
-          await terminalWs.close();
+          await terminalWs?.close();
           await app.close();
           logger.debug('[CONTROL SERVER] Server stopped');
         }

@@ -39,6 +39,7 @@ import { handleCodexCommand } from './commands/codexCommand'
 import { runPreToolUseCli } from './hooks/runPreToolUseCli'
 import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveMcpConfigPresetUrl } from './aplus/mcpConfigPresets'
+import { readManagedStartup } from '@/managed/managedStartup';
 
 
 (async () => {
@@ -114,6 +115,33 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
       process.exit(1)
     }
+    return;
+  } else if (subcommand === 'managed-boot') {
+    /*
+     * The root boot stage of a managed runtime, run by the image entrypoint
+     * **before** the daemon and before anything runs as the agent uid.
+     *
+     * It is a separate command rather than a step inside `daemon start` for
+     * two reasons: it needs root and the daemon does not, and the supervisor it
+     * starts has to outlive the daemon — a daemon restart that also restarted
+     * the ledger's owner would lose the lease enforcement for children that are
+     * still running.
+     *
+     * On a machine with no provisioning marker this exits 0 and does nothing:
+     * BYOS is not a failure. A marker that exists and cannot be trusted exits
+     * non-zero, and the entrypoint must not start the agent after that.
+     */
+    const { runManagedRuntimeBoot, defaultManagedRuntimeBootDeps } = await import('@/managed/managedRuntimeBoot');
+    const outcome = await runManagedRuntimeBoot(defaultManagedRuntimeBootDeps());
+    if (outcome.ok) {
+      console.log(`managed runtime boot: supervisor listening (${outcome.published})`);
+      return;
+    }
+    if (outcome.reason === 'not-managed') return;
+    // The reason is a fixed classifier. Paths, tokens and provider text stay
+    // out of it — this line lands in image build and boot logs.
+    console.error(chalk.red('managed runtime boot refused:'), outcome.reason);
+    process.exit(1);
     return;
   } else if (subcommand === 'sandbox') {
     try {
@@ -792,6 +820,21 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       process.exit(0)
     }
 
+    // A managed Cloud spawn brings its own session and a bearer scoped to it.
+    // It authenticates no account, registers no machine, and starts no daemon:
+    // there is no local user here, and the runtime it runs inside is what the
+    // control plane already knows about.
+    const managed = await readManagedStartup(process.env, Date.now());
+    if (managed) {
+      try {
+        await runClaude({ kind: 'managed', startup: managed }, options);
+      } catch (error) {
+        console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+        process.exit(1)
+      }
+      return;
+    }
+
     // Normal flow - auth and machine setup
     const {
       credentials
@@ -800,7 +843,7 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
 
     // Start the CLI
     try {
-      await runClaude(credentials, options);
+      await runClaude({ kind: 'account', credentials }, options);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       if (process.env.DEBUG) {

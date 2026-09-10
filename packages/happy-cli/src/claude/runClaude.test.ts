@@ -184,8 +184,11 @@ async function startRemoteRunClaudeHarness(opts: {
     mockLoop.mockReturnValue(loopDeferred.promise);
 
     const runPromise = runClaude({
-        token: 'token',
-        encryption: { type: 'legacy', secret: new Uint8Array(32) },
+        kind: 'account',
+        credentials: {
+            token: 'token',
+            encryption: { type: 'legacy', secret: new Uint8Array(32) },
+        },
     } as any, {
         startingMode: 'remote',
         shouldStartDaemon: false,

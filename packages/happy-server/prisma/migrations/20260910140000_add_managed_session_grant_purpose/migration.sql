@@ -1,0 +1,12 @@
+-- A session grant needs to say what it is for.
+--
+-- Without a purpose axis, the grant a browser is given to read a transcript is
+-- the same object a runner uses to post messages and register tools — so
+-- handing somebody a transcript hands them execution on that session.
+--
+-- `runner` is the historical behaviour, so existing rows and every current
+-- caller keep working unchanged. Values outside the three the server knows are
+-- refused at issue rather than folded into the default: folding an
+-- unrecognised purpose into `runner` would turn "we do not know what this is
+-- for" into full execution.
+ALTER TABLE "ManagedSessionGrant" ADD COLUMN "purpose" TEXT NOT NULL DEFAULT 'runner';

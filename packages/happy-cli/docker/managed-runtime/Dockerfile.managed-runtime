@@ -1,0 +1,42 @@
+# The managed runtime image's tool-execution layer.
+#
+# Build from the happy-cli package root, after `pnpm run build`:
+#
+#   pnpm run build
+#   docker build -f docker/managed-runtime/Dockerfile.managed-runtime .
+#
+# Everything it copies is either checked in or produced by that build — there
+# is no staging step to perform by hand, and nothing generated is committed.
+#
+# The modes are a read-only contract. The executor's trusted helper refuses to
+# exec a file that is writable by group or other, which `0755` would also
+# satisfy; `0555` and `0444` go further on purpose — nothing in the running
+# image, root included, has a reason to rewrite the code the agent is about to
+# become, and `assertManagedImageLayout` checks the exact bits rather than a
+# minimum so a drift shows up here instead of at runtime.
+#
+# `sqlite3` is a product dependency, not a convenience: without it every
+# project holding a SQLite database fails its checkpoint preflight.
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE} AS managed-runtime
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends sqlite3 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /usr/local/lib/saycode
+
+# Emitted by `pnpm run build` from the package's `./managed/image` export.
+COPY dist/managed/imageRuntimeEntry.cjs /usr/local/lib/saycode/toolRuntime.cjs
+COPY docker/managed-runtime/tool-workload.mjs /usr/local/lib/saycode/tool-workload.mjs
+COPY docker/managed-runtime/tool-workload /usr/local/lib/saycode/tool-workload
+
+RUN chown root:root /usr/local/lib/saycode/toolRuntime.cjs \
+                    /usr/local/lib/saycode/tool-workload.mjs \
+                    /usr/local/lib/saycode/tool-workload \
+ && chmod 0444 /usr/local/lib/saycode/toolRuntime.cjs \
+ && chmod 0444 /usr/local/lib/saycode/tool-workload.mjs \
+ && chmod 0555 /usr/local/lib/saycode/tool-workload
+
+COPY docker/managed-runtime/verify-image-layout.cjs /tmp/verify-image-layout.cjs
+RUN node /tmp/verify-image-layout.cjs && rm /tmp/verify-image-layout.cjs

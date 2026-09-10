@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
+  consumeConfirmedInitialPromptDelivery,
   INITIAL_PROMPT_INLINE_LIMIT_BYTES,
   consumePendingInitialAppendSystemPrompt,
   consumePendingInitialEffort,
@@ -210,5 +211,26 @@ describe('consumePendingInitialSaycodePromptBlocks', () => {
     expect(consumePendingInitialSaycodePromptBlocks({
       HAPPY_INITIAL_SAYCODE_PROMPT_BLOCKS: '{"workerDelegation":"no","axBase":false}',
     })).toEqual({ axBase: false })
+  })
+})
+
+describe('consumeConfirmedInitialPromptDelivery', () => {
+  it('is on only for the exact daemon-set value', () => {
+    expect(consumeConfirmedInitialPromptDelivery({ HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' })).toBe(true)
+  })
+
+  it('is off when absent or set to anything else', () => {
+    for (const value of [undefined, '', '0', 'false', 'true', 'yes']) {
+      const env = value === undefined ? {} : { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: value }
+      expect(consumeConfirmedInitialPromptDelivery(env)).toBe(false)
+    }
+  })
+
+  it('removes the key so a child this session spawns does not inherit it', () => {
+    const env: NodeJS.ProcessEnv = { HAPPY_MANAGED_REQUIRE_PROMPT_ACK: '1' }
+    expect(consumeConfirmedInitialPromptDelivery(env)).toBe(true)
+    expect('HAPPY_MANAGED_REQUIRE_PROMPT_ACK' in env).toBe(false)
+    // A second read finds nothing — the decision belonged to this launch only.
+    expect(consumeConfirmedInitialPromptDelivery(env)).toBe(false)
   })
 })

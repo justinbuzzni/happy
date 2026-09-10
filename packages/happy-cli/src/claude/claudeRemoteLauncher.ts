@@ -105,6 +105,17 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
     session.client.rpcHandlerManager.registerHandler('abort', doAbort); // When abort clicked
     session.client.rpcHandlerManager.registerHandler('switch', doSwitch); // When switch clicked
     session.client.rpcHandlerManager.registerHandler('steer', async (params: Record<string, unknown>) => {
+        if (session.managedRun) {
+            // A managed run answers exactly the prompt its envelope was admitted
+        // for. Steering and setting a goal are free-text instructions that
+        // reach the provider outside that admission — steering is injected
+        // into the turn already running, and a goal is carried into every turn
+        // after it. Refused before the provider or the queue is touched;
+        // clearing a goal removes an instruction rather than adding one, so it
+        // stays. Permission answers are bound to a request this run is already
+        // waiting on and are untouched.
+            return { success: false, error: 'A managed run cannot be steered' };
+        }
         const text = typeof params?.text === 'string' ? params.text : '';
         if (!text.trim()) {
             return { success: false, error: 'Steer text is required' };
@@ -348,6 +359,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 const remoteResult = await claudeRemote({
                     sessionId: session.sessionId,
                     path: session.path,
+                    managedSettingsLockdown: session.managedSettingsLockdown,
+                    managedRun: session.managedRun,
                     allowedTools: session.allowedTools ?? [],
                     mcpServers: session.mcpServers,
                     mcpConfig: session.mcpConfig ? {

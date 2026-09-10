@@ -8,6 +8,7 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 import { sessionArchive } from "@/app/session/sessionArchive";
+import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
 
 export function sessionRoutes(app: Fastify) {
 
@@ -123,8 +124,10 @@ export function sessionRoutes(app: Fastify) {
         });
     });
 
+    // A managed child may look up exactly its own session; the allowlist
+    // checks the body, because this route takes its scope from there.
     app.post('/v2/sessions/lookup', {
-        preHandler: app.authenticate,
+        preHandler: requireSessionScopeAuth(app) as never,
         schema: {
             body: z.object({
                 ids: z.array(z.string().min(1)).min(1).max(200)
@@ -133,6 +136,35 @@ export function sessionRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = request.userId;
         const uniqueIds = Array.from(new Set(request.body.ids));
+        /*
+         * A viewer reads with its own key envelope.
+         *
+         * The stored envelope is sealed for the account that owns the session.
+         * A member of a company project reading it is a **different account**,
+         * so the owner's envelope is bytes they cannot open — which shows up as
+         * an empty conversation rather than as a permissions problem. A read
+         * grant carries an envelope resealed for that viewer, and it is served
+         * instead.
+         *
+         * When there is none, none is sent: `null` means "you cannot decrypt
+         * this", which the client shows as locked. Substituting the owner's
+         * would turn an honest refusal into a silent blank.
+         */
+        const grant = request.managedGrant;
+        /*
+         * Only a viewer who is somebody else needs a resealed envelope. When
+         * the reader **is** the owner, the session's own envelope is already
+         * sealed for them, and swapping in a `null` would lock an owner out of
+         * their own transcript.
+         */
+        const grantViewer = grant?.purpose === 'transcript-read'
+            && grant.viewerAccountId
+            && grant.viewerAccountId !== grant.accountId
+            ? grant
+            : null;
+        const viewerEnvelope = grantViewer
+            ? { sessionId: grantViewer.sessionId, key: grantViewer.viewerDataEncryptionKey ?? null }
+            : null;
         const sessions = await db.session.findMany({
             where: {
                 accountId: userId,
@@ -168,7 +200,13 @@ export function sessionRoutes(app: Fastify) {
                     metadataVersion: v.metadataVersion,
                     agentState: v.agentState,
                     agentStateVersion: v.agentStateVersion,
-                    dataEncryptionKey: v.dataEncryptionKey ? Buffer.from(v.dataEncryptionKey).toString('base64') : null,
+                    dataEncryptionKey: viewerEnvelope && viewerEnvelope.sessionId === v.id
+                        ? (viewerEnvelope.key
+                            ? Buffer.from(viewerEnvelope.key).toString('base64')
+                            : null)
+                        : (v.dataEncryptionKey
+                            ? Buffer.from(v.dataEncryptionKey).toString('base64')
+                            : null),
                 }))
         });
     });

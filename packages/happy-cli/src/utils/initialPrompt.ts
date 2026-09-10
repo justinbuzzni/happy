@@ -166,6 +166,25 @@ export function consumePendingInitialAppendSystemPrompt(
   return raw && raw.trim().length > 0 ? raw : undefined
 }
 
+/**
+ * Whether this launch was asked for confirmed delivery of its initial prompt.
+ *
+ * The daemon sets this on a managed spawn, after the caller's environment has
+ * been merged, and the caller's own `HAPPY_MANAGED_` keys are stripped before
+ * that — so an external RPC cannot turn it on or off.
+ *
+ * It is a **behaviour switch only**. It grants no identity, ACL or fencing
+ * authority, and nothing downstream may treat its presence as proof of
+ * anything about the runtime. A trusted launch descriptor is T09's work.
+ */
+export function consumeConfirmedInitialPromptDelivery(env: NodeJS.ProcessEnv): boolean {
+  const raw = env.HAPPY_MANAGED_REQUIRE_PROMPT_ACK
+  // Consumed like the prompt itself: a child this session spawns must not
+  // inherit a delivery guarantee that was decided for its parent.
+  delete env.HAPPY_MANAGED_REQUIRE_PROMPT_ACK
+  return raw === '1'
+}
+
 export function consumePendingInitialPromptLocalId(env: NodeJS.ProcessEnv): string | undefined {
   const raw = env.HAPPY_INITIAL_PROMPT_LOCAL_ID
   delete env.HAPPY_INITIAL_PROMPT_LOCAL_ID
@@ -192,4 +211,23 @@ export function buildInitialPromptUserRecord(text: string, happySessionId: strin
     timestamp: new Date().toISOString(),
     message: { role: 'user', content: text },
   } as RawJSONLines
+}
+
+/**
+ * Begins waiting for one enqueued message to be durably acknowledged.
+ *
+ * Called **before** the message is enqueued: the returned promise must already
+ * be registered when the send happens, or a flush that starts immediately
+ * afterwards resolves the acknowledgement with nobody listening.
+ *
+ * `ok: false` means the acknowledgement was not observed — durability is
+ * unknown, which is not the same as the message having been lost.
+ */
+export type ConfirmInitialPromptDelivery = (localId: string) => Promise<{ ok: boolean; reason?: string }>
+
+export class InitialPromptNotDurableError extends Error {
+  constructor(readonly reason: string) {
+    super(`initial prompt durability unknown (${reason}); refusing to start the turn`)
+    this.name = 'InitialPromptNotDurableError'
+  }
 }

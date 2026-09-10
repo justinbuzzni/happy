@@ -238,6 +238,7 @@ export class CodexAppServerClient {
     private readonly protectedWriterTree: CheckpointWriterProcessTree | null;
     private sandboxCleanup: (() => Promise<void>) | null = null;
     private multiAuthProxy: PreparedCodexMultiAuthProxy | null = null;
+    private readonly managedProviderArgs: string[] | null;
     private multiAuthProxyCleanup: Promise<void> | null = null;
     public sandboxEnabled = false;
     /**
@@ -310,10 +311,19 @@ export class CodexAppServerClient {
         sandboxConfig?: SandboxConfig,
         beforeTurn?: () => Promise<CheckpointTurnPreparation | void>,
         completeTurn?: CheckpointSessionComposition['completeTurn'],
+        /**
+         * The provider configuration a managed Cloud run must use.
+         *
+         * Present only for a managed run, and then it is the whole story: the
+         * account-rotation proxy is not consulted, and the provider is not
+         * chosen from whatever is in the user's config file.
+         */
+        managedProviderArgs?: string[] | null,
     ) {
         this.sandboxConfig = sandboxConfig;
         this.beforeTurn = beforeTurn;
         this.completeTurn = completeTurn;
+        this.managedProviderArgs = managedProviderArgs ?? null;
         this.protectedWriterTree = completeTurn ? new CheckpointWriterProcessTree() : null;
     }
 
@@ -773,9 +783,17 @@ export class CodexAppServerClient {
         for (const [key, value] of Object.entries(process.env)) {
             if (typeof value === 'string') env[key] = value;
         }
-        this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
-        if (this.multiAuthProxy) {
-            env = this.multiAuthProxy.env;
+        if (!this.managedProviderArgs) {
+            // Account rotation swaps in another account's proxy, its own
+            // client key and its own base URL. For a managed run that is a
+            // different payer and a provider outside the approval, so the
+            // rotation is not consulted at all rather than consulted and
+            // overridden — a consulted rotation has already started a proxy
+            // and picked an account.
+            this.multiAuthProxy = await prepareCodexMultiAuthProxy(env);
+            if (this.multiAuthProxy) {
+                env = this.multiAuthProxy.env;
+            }
         }
 
         let command = 'codex';
@@ -783,7 +801,7 @@ export class CodexAppServerClient {
             'app-server',
             '--listen',
             'stdio://',
-            ...(this.multiAuthProxy?.args ?? []),
+            ...(this.managedProviderArgs ?? this.multiAuthProxy?.args ?? []),
         ];
         this.sandboxEnabled = false;
         this.sandboxInitFailed = false;

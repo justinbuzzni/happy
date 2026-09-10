@@ -61,6 +61,7 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
+  applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
   buildResumedSessionSpawnEnvironment,
   captureSaycodeAgentEnvironment,
@@ -121,6 +122,11 @@ import {
   hydrateTrackedSessionFromPersisted,
   mergeTrackedSessionWebhook,
 } from './persistedSessionHydration';
+import { resolveManagedRuntimeIdentity } from './managedRuntimeIdentity';
+import { acquireManagedWriterLock } from './managedWriterLock';
+import { createManagedReceiptStore } from './managedReceiptStore';
+import { createManagedRpcHandlers, type ManagedRpcHandlers } from './managedRpcHandlers';
+import { teardownManagedRuntime as runManagedTeardown } from './managedTeardown';
 import { createAutomationStore } from './automations/automationStore';
 import { rebaseAutomationsOnLaunch } from './automations/automationDomain';
 import { runAutomationTick } from './automations/automationTick';
@@ -220,6 +226,23 @@ import { captureAutonomousWorktreeFingerprint } from './autonomousQualityGateFin
 import { runAutonomousQualityGatePhase } from './autonomousQualityGateRunner';
 import { sendAutonomousQualityGateRepair } from './autonomousQualityGateMessageSender';
 import { createAutonomousQualityGateRpcHandlers } from './autonomousQualityGateRpc';
+import type { ManagedFilesystemFacts } from '@/managed/managedRuntimeFacts';
+import type { ManagedRestoreState } from '@/managed/managedRestoreState';
+import { resolveManagedFilesystemFacts } from '@/managed/managedRuntimeFacts';
+import { readManagedRestoreState } from '@/managed/managedRestoreState';
+import { resolveManagedVolumeBinding } from '@/managed/managedVolumeBinding';
+import {
+    observeManagedVolume,
+    readFsUuidForDevice,
+    readMountinfoText,
+} from '@/managed/managedRuntimeObserver';
+import { verifyOpenPathDevice } from '@/managed/managedRuntimeDurability';
+import { MANAGED_PROJECT_ROOT } from './managedRuntimeIdentity';
+import { readManagedLauncherBinding } from './launch/managedLauncherBinding';
+import { readManagedDaemonCredential } from './managedDaemonCredential';
+import { readManagedCredentialAction } from './managedCredentialWatch';
+import { createLauncherClient, createUnixSocketRequest } from './launch/launcherClient';
+import { defaultProvisioningDeps } from './managedRuntimeIdentity';
 
 /** Shell-escape a string for safe interpolation into tmux commands. */
 function shellescape(s: string): string {
@@ -247,6 +270,27 @@ export const initialMachineMetadata: MachineMetadata = {
   },
   additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
 };
+
+/**
+ * Whether this daemon runs script automations.
+ *
+ * Managed runtimes do not. The script worker prepares and recovers its own
+ * Docker containers and ticks on its own schedule, none of which goes through
+ * `spawnSession` — so the lease, epoch and budget checks that admit a managed
+ * run never see that work. The decision gates the whole initialisation rather
+ * than the tick, which is what keeps `prepare` and `recover` from running and
+ * leaves the automation protocol advertised at its legacy version.
+ *
+ * BYOS is unchanged: without the managed marker this is the same feature flag
+ * it has always been.
+ */
+export function shouldRunScriptAutomations(input: {
+    managedRuntimeActive: boolean;
+    enabled: string | undefined;
+}): boolean {
+    if (input.managedRuntimeActive) return false;
+    return input.enabled === '1';
+}
 
 export async function startDaemon(): Promise<void> {
   // The daemon can be auto-(re)started by any happy CLI child — including a
@@ -382,9 +426,221 @@ export async function startDaemon(): Promise<void> {
       logger.debug('[DAEMON RUN] Sleep prevention enabled');
     }
 
+    /*
+     * ── Which kind of machine this is, decided before any authentication ──
+     *
+     * The ordinary path authenticates a **person**: with no credential on disk
+     * it opens an interactive flow, and it invents a machine id with
+     * `randomUUID()`. Neither is right in a cloud runtime — there is nobody at a
+     * terminal, and the parent already registered this runtime's Machine and
+     * holds its id. A daemon that generated its own would publish readiness on
+     * an address nobody is listening on.
+     *
+     * So the marker is read first and the branch is taken here. It has to be
+     * *before* the auth call rather than after it: after, a managed runtime
+     * whose credential was missing would already have run the person's flow.
+     */
+    const managedIdentity = resolveManagedRuntimeIdentity();
+    if (managedIdentity.status === 'refused') {
+      throw new Error(
+        `[managed] provisioning marker present but not trusted (${managedIdentity.reason}); refusing to start`,
+      );
+    }
+    const managedCredential = managedIdentity.status === 'active'
+      ? readManagedDaemonCredential({
+        stateDir: managedIdentity.identity.stateDir,
+        // The marker says which Machine this runtime is; the credential is
+        // compared against it rather than believed.
+        expectedMachineId: managedIdentity.identity.happyMachineId,
+        now: Date.now(),
+        deps: defaultProvisioningDeps,
+      })
+      : null;
+    if (managedCredential && !managedCredential.ok) {
+      // Never a fallback. "No managed credential" must not become "authenticate
+      // as a person instead", which ends with a cloud runtime holding an
+      // account bearer that reaches every session on that account.
+      throw new Error(
+        `[managed] daemon credential unusable (${managedCredential.reason}); refusing to start`,
+      );
+    }
+
     // Ensure auth and machine registration BEFORE anything else
-    const { credentials, machineId, serverPublicKey } = await authAndSetupMachineIfNeeded();
+    const { credentials, machineId, serverPublicKey } = managedCredential?.ok
+      ? {
+        credentials: {
+          token: managedCredential.credential.token,
+          encryption: {
+            type: 'dataKey' as const,
+            publicKey: managedCredential.credential.accountPublicKey,
+            machineKey: managedCredential.credential.machineKey,
+          },
+        },
+        machineId: managedCredential.credential.machineId,
+        serverPublicKey: null,
+      }
+      : await authAndSetupMachineIfNeeded();
     logger.debug('[DAEMON RUN] Auth and machine setup complete');
+
+    // ── Managed runtime admission, decided before anything can accept work ──
+    //
+    // This runs ahead of the control server, the RPC listener and session
+    // restoration on purpose. Deciding later leaves a window in which the
+    // legacy spawn entry points are already reachable on a runtime that should
+    // never have served them.
+    //
+    // Resolved exactly once: a later edit to the provisioning file cannot flip
+    // a running daemon's mode. `refused` does not fall back to BYOS — a marker
+    // that exists but cannot be trusted is a downgrade attempt, and reopening
+    // the legacy path is the outcome it is after.
+    let managedWriterLockHeld = false;
+    /**
+     * The runtime's own view of itself, for a status read.
+     *
+     * Nothing here is cached as "ready": the mount is re-read, the completion
+     * record is re-read through its trusted path, and the isolation backend is
+     * asked again. A status that answered from a snapshot would keep saying
+     * ready after the thing it described stopped being true.
+     */
+    let managedRuntimeFacts: () => {
+      filesystem: ManagedFilesystemFacts;
+      restore: ManagedRestoreState;
+      isolation: { verified: boolean; backend: string };
+    } = () => ({
+      filesystem: { ok: false, reason: 'root-not-mounted' },
+      restore: { status: 'pending', checkpointId: null, manifestDigest: null },
+      isolation: { verified: false, backend: 'privileged-launch-supervisor' },
+    });
+    /**
+     * The privileged launch backend, if this runtime has one.
+     *
+     * It is not created here: the supervisor is a **separate root process**
+     * that owns the IPC socket, the watchdog and the durable manifest, and it
+     * outlives this daemon on purpose — killing the daemon must not become an
+     * unbounded lease extension. What happens here is only that the daemon
+     * finds it and speaks to it.
+     *
+     * It stays `null` when the trusted boot path left no binding. That is
+     * fail-closed and it is deliberate: every handler that needs a proof
+     * refuses without one, which is the right answer, whereas a daemon that
+     * invented a backend would answer "proven stopped" about generations that
+     * are still running.
+     */
+    let managedFencingBackend: ReturnType<typeof createLauncherClient> | null = null;
+    let releaseManagedWriterLock: (() => Promise<void>) | null = null;
+    if (managedIdentity.status === 'active') {
+      const lock = await acquireManagedWriterLock({ runtimeId: managedIdentity.identity.runtimeId });
+      if (!lock.ok) {
+        // Never steal and never guess: another writer may hold the receipts.
+        throw new Error(`[managed] writer lock unavailable (${lock.reason}); refusing to start`);
+      }
+      managedWriterLockHeld = true;
+      releaseManagedWriterLock = lock.release;
+
+      // The address in the marker has to be the machine this daemon actually
+      // registered as. A provisioner that wrote one id while the daemon
+      // registered another leaves the parent publishing readiness for a
+      // machine nobody is listening on — and, worse, possibly for somebody
+      // else's. Compared here rather than trusted, and a mismatch refuses the
+      // start rather than degrading to the legacy path.
+      if (managedIdentity.identity.happyMachineId !== machineId) {
+        throw new Error(
+          '[managed] provisioned Happy machine id does not match the registered machine; refusing to start',
+        );
+      }
+
+
+      /*
+       * Where the supervisor is comes from the **canonical state directory**
+       * the provisioning marker named, written there by the trusted boot path
+       * before the agent uid existed. There is no environment fallback: an
+       * inherited value is chosen by whoever started this process, and a daemon
+       * pointed at somebody else's socket is told whatever that socket likes.
+       *
+       * The boot token stops here. It is handed to the client and never put
+       * into the environment a provider later inherits.
+       */
+      const launcher = readManagedLauncherBinding({
+        stateDir: managedIdentity.identity.stateDir,
+        deps: defaultProvisioningDeps,
+      });
+      if (launcher.ok) {
+        managedFencingBackend = createLauncherClient({
+          token: launcher.binding.token,
+          deps: createUnixSocketRequest(launcher.binding.socketPath),
+        });
+        logger.debug('[managed] privileged launch backend bound');
+      } else {
+        // Named, not detailed: the reason is a fixed classifier, and the paths
+        // and token behind it are not log material.
+        logger.debug(`[managed] no privileged launch backend (${launcher.reason})`);
+      }
+
+      /*
+       * The volume seal: written **once**, on the boot that observed it.
+       *
+       * The provider id comes from the marker only root can write, and the
+       * device and filesystem identity are observed here — the runtime cannot
+       * derive the first and the parent cannot see the other two, which is why
+       * the three are bound together rather than any one of them being taken
+       * as the answer. An unobservable volume seals nothing: not knowing is
+       * not evidence, and a seal written on a guess is what would later let a
+       * volume full of real work be called freshly initialised.
+       */
+      const identityForFacts = managedIdentity.identity;
+      const volume = await resolveManagedVolumeBinding({
+        stateDir: identityForFacts.stateDir,
+        providerVolumeId: identityForFacts.providerVolumeId,
+        observe: () => observeManagedVolume({ projectRoot: MANAGED_PROJECT_ROOT }),
+        deps: defaultProvisioningDeps,
+      });
+      if (!volume.ok) {
+        logger.debug(`[managed] volume not bound (${volume.reason})`);
+      }
+
+      /*
+       * A status read answers with what this daemon can actually verify, and
+       * verifies it **again on every read**.
+       *
+       * Nothing below is cached: the mount table is re-read, the filesystem
+       * identity is re-read, the completion record is re-read through its
+       * trusted path, and the isolation backend is asked again. A status that
+       * answered from a snapshot would keep saying ready after the volume was
+       * detached or the backend stopped answering — and the parent dispatches
+       * on that answer.
+       *
+       * Without a seal every axis stays at its fail-closed value. That is not
+       * a degraded mode to be improved by assuming something: a runtime that
+       * cannot say which volume it is on has nothing to compare a record to.
+       */
+      const bound = volume.ok ? volume.binding : null;
+      managedRuntimeFacts = () => ({
+        filesystem: bound === null
+          ? { ok: false, reason: 'volume-evidence-unavailable' }
+          : resolveManagedFilesystemFacts({
+            mountinfo: readMountinfoText() ?? '',
+            projectRoot: MANAGED_PROJECT_ROOT,
+            binding: bound,
+            readFsUuid: (device) => readFsUuidForDevice(device),
+            verifyOpenDevice: verifyOpenPathDevice,
+          }),
+        restore: bound === null
+          ? { status: 'pending', checkpointId: null, manifestDigest: null }
+          : readManagedRestoreState({
+            stateDir: identityForFacts.stateDir,
+            // The record is read **against the volume that is mounted now**,
+            // not against the one it claims to describe. A record beside a
+            // different filesystem is a record about something else.
+            volume: { volumeId: bound.providerVolumeId, deviceUuid: bound.fsUuid },
+            deps: defaultProvisioningDeps,
+          }),
+        isolation: {
+          verified: managedFencingBackend !== null,
+          backend: identityForFacts.isolation.backend,
+        },
+      });
+      logger.debug(`[managed] runtime ${managedIdentity.identity.runtimeId} admitted`);
+    }
     let machineAutomationKey = loadOrCreateMachineAutomationKey(configuration.automationKeyFile);
     const mcpCallerGrantKeyPair = tweetnacl.box.keyPair();
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
@@ -1140,6 +1396,16 @@ export async function startDaemon(): Promise<void> {
           managedAiCredentialEnvironment,
         );
 
+        // Set after the caller's environment has been merged and expanded, so
+        // an external RPC cannot switch it off by supplying the same key. The
+        // caller's `HAPPY_MANAGED_` keys were already stripped upstream; this
+        // is the daemon's own decision, taken from an internal spawn option
+        // rather than anything the caller sent.
+        //
+        // It only turns on stricter delivery for this launch. It is not an
+        // identity, and nothing may read it as one.
+        const requireInitialPromptAck = options.requireInitialPromptAck === true;
+
         // Initial prompt (scheduled automations 등): 불투명한 사용자 텍스트라
         // 위의 ${VAR} 확장·검증을 통과시키면 안 된다 — 프롬프트 속 "${FOO}"는
         // 참조가 아니라 내용이다. 그래서 확장/검증 이후에 주입한다. tmux 경로와
@@ -1251,10 +1517,13 @@ export async function startDaemon(): Promise<void> {
           const windowName = `happy-${Date.now()}-${agent}`;
           // Explicit agent auth and task callbacks are overlaid after inherited
           // credentials are filtered, so isolated tasks keep only what they need.
-          const tmuxEnv = buildManagedSessionSpawnEnvironment(
-            inheritedSpawnEnvironment,
-            extraEnv,
-            managedAiCredentialEnvironment,
+          const tmuxEnv = applyConfirmedPromptDeliveryFlag(
+            buildManagedSessionSpawnEnvironment(
+              inheritedSpawnEnvironment,
+              extraEnv,
+              managedAiCredentialEnvironment,
+            ),
+            requireInitialPromptAck,
           );
 
           const tmuxResult = await tmux.spawnInTmux([fullCommand], {
@@ -1344,10 +1613,13 @@ export async function startDaemon(): Promise<void> {
             // scrub: 상속된 lineage env(HAPPY_RECONNECT_*/HAPPY_FORK*)가 새
             // 세션을 기존 세션에 재접속시키는 것을 차단. extraEnv 의 명시적
             // fork 값들은 scrub 이후에 덮어써져 그대로 전달된다.
-            env: buildManagedSessionSpawnEnvironment(
-              inheritedSpawnEnvironment,
-              extraEnv,
-              managedAiCredentialEnvironment,
+            env: applyConfirmedPromptDeliveryFlag(
+              buildManagedSessionSpawnEnvironment(
+                inheritedSpawnEnvironment,
+                extraEnv,
+                managedAiCredentialEnvironment,
+              ),
+              requireInitialPromptAck,
             ),
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
@@ -2375,6 +2647,7 @@ export async function startDaemon(): Promise<void> {
       browserBridge,
       // 제어 서버의 파일 접근도 같은 잠금 정책을 따른다(HAPPY_RPC_ALLOWED_ROOT).
       allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+      managedRuntime: managedIdentity.status === 'active',
       getMachineEncryption: () => machineEncryptionForTerminalWs,
     });
 
@@ -2433,7 +2706,20 @@ export async function startDaemon(): Promise<void> {
     };
 
     // Create API client
-    const api = await ApiClient.create(credentials);
+    //
+    // A managed runtime gets a **different principal**, not the account client
+    // with a different token: it may read the Machine the parent registered and
+    // nothing else — no registration, no account push, no key derivation.
+    const api = managedCredential?.ok
+      ? ApiClient.managedMachine({
+        machineId: managedCredential.credential.machineId,
+        token: managedCredential.credential.token,
+        machineKey: managedCredential.credential.machineKey,
+        // Validated against the server this process actually talks to. A
+        // credential for another Happy is refused here rather than sent there.
+        serverOrigin: managedCredential.credential.serverOrigin,
+      })
+      : await ApiClient.create(credentials);
 
     // Get or create machine.
     //
@@ -2449,7 +2735,19 @@ export async function startDaemon(): Promise<void> {
     // nothing re-runs registration for the life of the process, so if the row
     // was never created the socket RPCs keep failing until the daemon restarts.
     let machine: Machine;
-    try {
+    if (managedCredential?.ok) {
+      /*
+       * Attached, not registered, and **not degraded to offline**.
+       *
+       * The offline fallback below is right for a laptop: a person's daemon
+       * should keep serving local work when the network is down. Here it would
+       * mean a cloud runtime answering the parent about a machine registration
+       * that may not exist — and the parent dispatches on that answer. So a
+       * managed runtime that cannot reach its own Machine does not start.
+       */
+      machine = await api.attachRegisteredMachine();
+      logger.debug(`[DAEMON RUN] Managed machine attached: ${machine.id}`);
+    } else try {
       machine = await api.getOrCreateMachine({
         machineId,
         metadata: initialMachineMetadata,
@@ -2472,6 +2770,141 @@ export async function startDaemon(): Promise<void> {
 
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
+    /** Set only for a managed runtime; the beat below keeps it current. */
+    let managedCredentialState: {
+      stateDir: string;
+      machineId: string;
+      current: { token: string; expiresAt: number };
+    } | null = managedCredential?.ok && managedIdentity.status === 'active'
+      ? {
+        stateDir: managedIdentity.identity.stateDir,
+        machineId: managedCredential.credential.machineId,
+        current: {
+          token: managedCredential.credential.token,
+          expiresAt: managedCredential.credential.expiresAt,
+        },
+      }
+      : null;
+    let managedLeaseWatchdog: ReturnType<typeof setInterval> | null = null;
+    /** Drains every in-flight managed operation; set once the handlers exist. */
+    let managedDrainLeaseWork: (() => Promise<void>) | null = null;
+    /** Refuses new managed RPC entries; set once the handlers exist. */
+    let managedCloseEntries: (() => void) | null = null;
+
+    /**
+     * Shared by both exits — normal shutdown and the self-update replacement.
+     *
+     * The ordering lives in `managedTeardown.ts` so the daemon and its tests
+     * exercise the same function rather than two descriptions of it.
+     */
+    const teardownManagedRuntime = async (): Promise<void> => runManagedTeardown({
+      active: managedIdentity.status === 'active',
+      stopWatchdog: () => {
+        if (managedLeaseWatchdog) {
+          clearInterval(managedLeaseWatchdog);
+          managedLeaseWatchdog = null;
+        }
+      },
+      closeEntries: () => managedCloseEntries?.(),
+      drain: async () => { await managedDrainLeaseWork?.(); },
+      // Only after the drain: work already inside must be able to record what
+      // it did, or a launch that succeeded is left looking unfinished.
+      closeWrites: () => { managedWriterLockHeld = false; },
+      releaseLock: async () => {
+        if (!releaseManagedWriterLock) return;
+        const release = releaseManagedWriterLock;
+        releaseManagedWriterLock = null;
+        await release();
+      },
+      backendWired: managedFencingBackend !== null,
+      logDebug: (message) => logger.debug(message),
+    });
+
+    // The managed dispatch surface. Identity and the writer lock were settled
+    // during early bootstrap; this only builds what needs `spawnSession`.
+    if (managedIdentity.status === 'active') {
+      const identity = managedIdentity.identity;
+      const store = createManagedReceiptStore(identity.stateDir, {
+        assertHeld: (action) => {
+          if (!managedWriterLockHeld) {
+            throw new Error(`managed writer lock not held; refusing ${action}`);
+          }
+        },
+      });
+      const managedHandlers = createManagedRpcHandlers({
+        identity,
+        store,
+        // The managed path reuses the existing spawn implementation rather than
+        // duplicating it; only admission and bookkeeping are new.
+        spawn: async (request, context) => {
+          logger.debug(
+            `[managed] launching run=${context.runId} attempt=${context.attemptId} epoch=${context.epoch}`,
+          );
+          const result = await spawnSession({
+            directory: request.directory,
+            agent: request.agent as SpawnSessionOptions['agent'],
+            // Forced here from the verified dispatch context, not taken from
+            // `request`: the caller does not get to choose whether its own
+            // prompt delivery is confirmed.
+            requireInitialPromptAck: true,
+            ...(request.environmentVariables ? { environmentVariables: request.environmentVariables } : {}),
+            ...(request.initialPrompt ? { initialPrompt: request.initialPrompt } : {}),
+            ...(request.initialPromptLocalId ? { initialPromptLocalId: request.initialPromptLocalId } : {}),
+          });
+          if (result.type === 'success' && result.sessionId) {
+            const tracked = findTrackedSessionById(result.sessionId);
+            if (tracked?.pid) return { type: 'success', sessionId: result.sessionId, pid: tracked.pid };
+            // The session exists but its pid was never seen: reporting an error
+            // without `started: false` keeps it reconcilable instead of closed.
+            return { type: 'error', errorMessage: 'session started without a tracked pid' };
+          }
+          if (result.type === 'requestToApproveDirectoryCreation') {
+            return { type: 'error', errorMessage: 'directory approval required', started: false };
+          }
+          return { type: 'error', errorMessage: 'spawn failed' };
+        },
+        // The daemon asks; the supervisor decides and proves. Absent when the
+        // boot path bound none, and every path that needs a proof then refuses.
+        ...(managedFencingBackend ? { fencingBackend: managedFencingBackend } : {}),
+        isPidAlive,
+        now: Date.now,
+        monotonicNow: () => Number(process.hrtime.bigint() / 1_000_000n),
+        // What this runtime can say about itself, read fresh on every status
+        // request rather than captured once: a volume can be lost and an
+        // isolation backend can stop answering, and a cached "ready" would
+        // outlive both.
+        runtimeFacts: () => managedRuntimeFacts(),
+      });
+      // Installed before setRPCHandlers so the allowlist sweeps the handlers
+      // the constructor already registered and intercepts the rest.
+      apiMachine.setManagedRuntime(managedHandlers);
+      managedDrainLeaseWork = () => managedHandlers.drainLeaseWork();
+      managedCloseEntries = () => managedHandlers.closeEntries();
+      // The handler serializes expiry against renewal and promotion, so the
+      // interval only has to avoid piling work onto that queue: a tick is
+      // skipped while the previous one is still outstanding.
+      let watchdogBusy = false;
+      managedLeaseWatchdog = setInterval(() => {
+        if (watchdogBusy) return;
+        watchdogBusy = true;
+        void managedHandlers.runLeaseMaintenance().then((outcome) => {
+          // Keyed on `actionRequired` alone: a refused stop under a *valid*
+          // lease is exactly the case an `expired &&` condition would hide.
+          if (outcome.actionRequired) {
+            logger.debug(
+              `[managed] action required (expired=${outcome.expired}); `
+              + `${outcome.live.length} handed over, ${outcome.unstoppable.length} not accepted, `
+              + `${outcome.pendingStopsRetried} stop(s) retried, storeUnreadable=${outcome.storeUnreadable}`,
+            );
+          }
+        }).catch((error) => {
+          logger.debug(`[managed] lease watchdog failed: ${(error as Error).message}`);
+        }).finally(() => {
+          watchdogBusy = false;
+        });
+      }, 5_000);
+      managedLeaseWatchdog.unref();
+    }
     const claudeSwapSupervisor = createClaudeSwapSupervisor(
       join(configuration.happyHomeDir, 'claude-swap-supervisor.json'),
     );
@@ -2481,7 +2914,10 @@ export async function startDaemon(): Promise<void> {
     resolveManagedAiCredentialEnvironment = (agent) => aiCredentialRuntime.sessionEnvironment(agent);
     let activeServerAutomationLeaseCount = 0;
     let scriptWorker: ReturnType<typeof createScriptAutomationWorker> | null = null;
-    if (process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED === '1') {
+    if (shouldRunScriptAutomations({
+        managedRuntimeActive: managedIdentity.status === 'active',
+        enabled: process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED,
+    })) {
       try {
         const image = process.env.HAPPY_SCRIPT_RUNTIME_IMAGE;
         if (!image) throw new Error('SCRIPT_RUNTIME_IMAGE_REQUIRED');
@@ -2832,6 +3268,39 @@ export async function startDaemon(): Promise<void> {
         logger.debug(`[DAEMON RUN] Health check started at ${new Date().toLocaleString()}`);
       }
 
+      /*
+       * A managed runtime's credential is renewed by the parent while this
+       * process runs, and it expires if nobody does.
+       *
+       * Checked on the beat that already exists rather than on a timer of its
+       * own: a second loop would have to be stopped in every shutdown path,
+       * and one that was missed would keep a dead runtime alive.
+       *
+       * A renewal only changes what the **next** connection presents. The live
+       * socket authenticated when it opened and is left alone — dropping it to
+       * apply a token it does not need would interrupt running work.
+       */
+      if (managedCredentialState) {
+        const action = readManagedCredentialAction({
+          stateDir: managedCredentialState.stateDir,
+          expectedMachineId: managedCredentialState.machineId,
+          current: managedCredentialState.current,
+          now: Date.now(),
+        });
+        if (action.kind === 'renewed') {
+          apiMachine.replaceToken(action.token);
+          managedCredentialState.current = { token: action.token, expiresAt: action.expiresAt };
+          logger.debug('[DAEMON RUN] Managed credential renewed');
+        } else if (action.kind === 'stop') {
+          // Not retried and not degraded: reconnecting with a dead bearer looks
+          // like a network fault to everyone while the parent already knows
+          // this runtime is no longer authorised.
+          logger.debug(`[DAEMON RUN] Managed credential ${action.reason}; stopping the machine socket`);
+          managedCredentialState = null;
+          apiMachine.stopForExpiredCredential();
+        }
+      }
+
       // Prune stale sessions
       let sessionsPruned = false;
       for (const [pid, _] of pidToTrackedSession.entries()) {
@@ -2963,6 +3432,7 @@ export async function startDaemon(): Promise<void> {
             await stopControlServer();
             await stopBrowserBridge();
             await cleanupDaemonState();
+            await teardownManagedRuntime();
             await releaseDaemonLock(daemonLockHandle);
             await stopCaffeinate();
           },
@@ -3085,6 +3555,7 @@ export async function startDaemon(): Promise<void> {
       });
 
       await stopCaffeinate();
+      await teardownManagedRuntime();
       await releaseDaemonLock(daemonLockHandle);
 
       logger.debug('[DAEMON RUN] Cleanup completed, exiting process');

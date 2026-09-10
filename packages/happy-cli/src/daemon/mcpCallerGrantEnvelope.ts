@@ -46,6 +46,10 @@ export function injectMcpCallerGrant(
             .filter(([key]) => (
                 !key.startsWith('HAPPY_APLUS_')
                 && !key.startsWith('HAPPY_BROWSER_VIEWER_')
+                // Managed runtime identity and state paths must not reach agent
+                // code: the default spawn path forwards the daemon's whole
+                // environment, so anything left here is readable by the agent.
+                && !key.startsWith('HAPPY_MANAGED_')
             )),
     );
     if (trustedConfigUrl) {

@@ -60,6 +60,11 @@ async function createApp() {
         request.userId = userId;
     });
 
+    // These cases are about the account path, so the session-scope decorator
+    // stands in as the same account-only check. It has to be present: the
+    // routes refuse to register without it rather than losing their preHandler.
+    typed.decorate("authenticateSessionScope", (typed as any).authenticate);
+
     sessionRoutes(typed);
     await typed.ready();
     return typed;

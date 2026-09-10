@@ -10,35 +10,200 @@ import chalk from 'chalk';
 import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError, isConnectivityError, connectionErrorCode } from '@/utils/serverConnectionErrors';
 import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
+import type { ManagedAttachment } from '@/managed/managedSessionAttach';
+
+/**
+ * Who this client is.
+ *
+ * The two are genuinely different principals, not one shape with some fields
+ * missing: an account holds encryption material and can create sessions and
+ * machines; a managed session holds a bearer scoped to one session that was
+ * created for it. Modelling the second as a `Credentials` with holes in it
+ * would let account-only code compile against something that cannot serve it.
+ */
+type ApiPrincipal =
+  | { kind: 'account'; credential: Credentials }
+  | { kind: 'managed-session'; attachment: ManagedAttachment }
+  /**
+   * The daemon of a managed runtime.
+   *
+   * A third principal, and it has to be: it holds a machine-scoped bearer and
+   * the raw key of a Machine **somebody else registered**. It is not an account
+   * — it has no account bearer and cannot create machines or sessions — and it
+   * is not a managed session, which is scoped to one session it did not create.
+   * Modelling it as either would give it a member that must never work here:
+   * as an account it could register a machine and push to the account, and as a
+   * session it could not read the machine it is supposed to be.
+   */
+  | {
+    kind: 'managed-machine';
+    machineId: string;
+    token: string;
+    /** The raw machine key the parent wrapped. Used to read, never re-wrapped. */
+    machineKey: Uint8Array;
+  };
 
 export class ApiClient {
 
   static async create(credential: Credentials) {
-    return new ApiClient(credential);
+    return new ApiClient({ kind: 'account', credential });
   }
 
-  private readonly credential: Credentials;
-  private readonly pushClient: PushNotificationClient;
+  /**
+   * A client for a session this process did not create.
+   *
+   * It holds a bearer scoped to one session and nothing else. There is no
+   * account credential here — not a stand-in, not a cast — so the
+   * account-shaped members are simply unreachable: `accountCredential()`
+   * refuses, and the paths that need account encryption material or a push
+   * registration go through it.
+   */
+  static managed(attachment: ManagedAttachment) {
+    return new ApiClient({ kind: 'managed-session', attachment });
+  }
 
-  private constructor(credential: Credentials) {
-    this.credential = credential
-    this.pushClient = new PushNotificationClient(credential.token, configuration.serverUrl)
+  private readonly principal: ApiPrincipal;
+  private readonly pushClient: PushNotificationClient | null;
+
+  private constructor(principal: ApiPrincipal) {
+    this.principal = principal
+    // Push registration is an **account** capability. A managed runtime must
+    // not register for the customer's notifications: its bearer is scoped to
+    // this machine, and pushing from it would put runtime activity into the
+    // account's notification stream as if the person had done it.
+    this.pushClient = principal.kind === 'account'
+      ? new PushNotificationClient(principal.credential.token, configuration.serverUrl)
+      : null
+  }
+
+  /**
+   * A client for a Machine the trusted parent already registered.
+   *
+   * It never creates: `getOrCreateMachine` refuses for this principal, and the
+   * attach path below reads. Registration would either fail (the bearer is not
+   * the account's) or, worse, overwrite key material the server treats as
+   * write-once — after which nothing could read the machine again.
+   */
+  static managedMachine(input: {
+    machineId: string;
+    token: string;
+    machineKey: Uint8Array;
+    /** The Happy this credential was issued for, as the parent recorded it. */
+    serverOrigin: string;
+  }) {
+    /*
+     * The credential names its server, and this process talks to whatever
+     * `configuration.serverUrl` says. Checked **here**, before any request:
+     * a bearer sent to a host it was not issued for is a bearer handed to
+     * somebody else, and discovering the mismatch from a failed request would
+     * mean it had already been sent. Failing at construction also makes it a
+     * startup error rather than an intermittent one.
+     */
+    const configured = new URL(configuration.serverUrl).origin;
+    if (new URL(input.serverOrigin).origin !== configured) {
+      throw new Error('this managed credential was issued for a different server');
+    }
+    return new ApiClient({
+      kind: 'managed-machine',
+      machineId: input.machineId,
+      token: input.token,
+      machineKey: input.machineKey,
+    });
   }
 
   /**
    * Create a new session or load existing one with the given tag
    */
+  /**
+   * The account this client acts for, or a refusal.
+   *
+   * Reached only by code that genuinely needs account material. A managed
+   * session has none, and saying so here is the whole point of the split.
+   */
+  private accountCredential(): Credentials {
+    if (this.principal.kind !== 'account') {
+      throw new Error('this operation needs an account credential; a managed session has none');
+    }
+    return this.principal.credential;
+  }
+
+  /** The bearer this client presents, whichever principal it is. */
+  private bearer(): string {
+    if (this.principal.kind === 'account') return this.principal.credential.token;
+    if (this.principal.kind === 'managed-machine') return this.principal.token;
+    return this.principal.attachment.scopedToken;
+  }
+
+  /**
+   * Reads the Machine this runtime **is**, and refuses anything else.
+   *
+   * Three things it deliberately does not do:
+   *
+   *  - **It does not create.** The Machine exists; the parent registered it
+   *    with key material the server treats as write-once.
+   *  - **It does not derive or wrap keys.** The key arrives from the parent
+   *    through the protected credential. Deriving one here would produce a key
+   *    the server never stored, and the machine would be unreadable forever.
+   *  - **It does not fall back offline.** The ordinary path can synthesise a
+   *    local Machine when the server is unreachable, which is right for a
+   *    laptop and wrong here: a runtime that proceeded on a synthesised machine
+   *    would answer the parent about a registration that does not exist.
+   *
+   * The id is compared, not adopted: a response describing another Machine is
+   * the one case where continuing would attach this runtime to somebody else's.
+   */
+  async attachRegisteredMachine(): Promise<Machine> {
+    if (this.principal.kind !== 'managed-machine') {
+      throw new Error('attaching to a registered machine needs a managed runtime credential');
+    }
+    const { machineId, machineKey } = this.principal;
+    const response = await axios.get(
+      `${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${this.bearer()}`,
+          'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`,
+        },
+        timeout: 60000,
+      },
+    );
+    const raw = response.data?.machine;
+    if (!raw || raw.id !== machineId) {
+      throw new Error('the server returned a different machine than this runtime is');
+    }
+    return {
+      id: raw.id,
+      encryptionKey: machineKey,
+      // The parent wrapped a data key for this Machine; there is no legacy
+      // secret on a managed runtime and nothing here may invent one.
+      encryptionVariant: 'dataKey',
+      metadata: raw.metadata ? decrypt(machineKey, 'dataKey', decodeBase64(raw.metadata)) : null,
+      metadataVersion: raw.metadataVersion || 0,
+      daemonState: raw.daemonState
+        ? decrypt(machineKey, 'dataKey', decodeBase64(raw.daemonState))
+        : null,
+      daemonStateVersion: raw.daemonStateVersion || 0,
+    };
+  }
+
   async getOrCreateSession(opts: {
     tag: string,
     metadata: Metadata,
     state: AgentState | null
   }): Promise<Session | null> {
+    if (this.principal.kind === 'managed-session') {
+      // Refused here rather than at the server: a managed run that reached
+      // this point would create a session sealed with a key its parent never
+      // saw, and nothing downstream could read the result.
+      throw new Error('managed sessions are created by the parent, not by this process');
+    }
 
     // Resolve encryption key
     let dataEncryptionKey: Uint8Array | null = null;
     let encryptionKey: Uint8Array;
     let encryptionVariant: 'legacy' | 'dataKey';
-    if (this.credential.encryption.type === 'dataKey') {
+    const accountEncryption = this.accountCredential().encryption;
+    if (accountEncryption.type === 'dataKey') {
 
       // Generate new encryption key
       encryptionKey = getRandomBytes(32);
@@ -47,9 +212,9 @@ export class ApiClient {
       // Derive and encrypt data encryption key
       // const contentDataKey = await deriveKey(this.secret, 'Happy EnCoder', ['content']);
       // const publicKey = libsodiumPublicKeyFromSecretKey(contentDataKey);
-      dataEncryptionKey = wrapDataEncryptionKey(encryptionKey, this.credential.encryption.publicKey);
+      dataEncryptionKey = wrapDataEncryptionKey(encryptionKey, accountEncryption.publicKey);
     } else {
-      encryptionKey = this.credential.encryption.secret;
+      encryptionKey = accountEncryption.secret;
       encryptionVariant = 'legacy';
     }
 
@@ -65,7 +230,7 @@ export class ApiClient {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
+            'Authorization': `Bearer ${this.bearer()}`,
             'Content-Type': 'application/json',
             'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`
           },
@@ -171,13 +336,14 @@ export class ApiClient {
     encryptionVariant: 'legacy' | 'dataKey',
     wrapMaterial: { machineKey: Uint8Array, accountPublicKey: Uint8Array } | null,
   } {
-    if (this.credential.encryption.type === 'dataKey') {
+    const machineEncryption = this.accountCredential().encryption;
+    if (machineEncryption.type === 'dataKey') {
       return {
-        encryptionKey: this.credential.encryption.machineKey,
+        encryptionKey: machineEncryption.machineKey,
         encryptionVariant: 'dataKey',
         wrapMaterial: {
-          machineKey: this.credential.encryption.machineKey,
-          accountPublicKey: this.credential.encryption.publicKey,
+          machineKey: machineEncryption.machineKey,
+          accountPublicKey: machineEncryption.publicKey,
         },
       };
     }
@@ -186,12 +352,12 @@ export class ApiClient {
     // 있으면 wrap 된 machineKey 를 서버에 등록한다 (서버는 write-once
     // 백필). RPC 암호화는 여전히 legacy secret — 동작 무변경.
     return {
-      encryptionKey: this.credential.encryption.secret,
+      encryptionKey: machineEncryption.secret,
       encryptionVariant: 'legacy',
-      wrapMaterial: this.credential.encryption.provisioned
+      wrapMaterial: machineEncryption.provisioned
         ? {
-          machineKey: this.credential.encryption.provisioned.machineKey,
-          accountPublicKey: this.credential.encryption.provisioned.publicKey,
+          machineKey: machineEncryption.provisioned.machineKey,
+          accountPublicKey: machineEncryption.provisioned.publicKey,
         }
         : null,
     };
@@ -234,6 +400,18 @@ export class ApiClient {
      *  서버 몫으로도 wrap 해 serverDataEncryptionKey 로 등록한다. */
     serverPublicKey?: string | null,
   }): Promise<Machine> {
+    if (this.principal.kind === 'managed-session') {
+      // A managed child has no machine identity of its own; the runtime it
+      // runs inside is the registered thing, and its scoped bearer could not
+      // register one anyway.
+      throw new Error('a managed session does not register a machine');
+    }
+    if (this.principal.kind === 'managed-machine') {
+      // The parent registered this Machine, with key material the server keeps
+      // write-once. Registering again would at best be a no-op and at worst
+      // replace what the parent stored — and then nothing can read the machine.
+      throw new Error('a managed runtime does not register its own machine');
+    }
 
     const { encryptionKey, encryptionVariant, wrapMaterial } = this.resolveMachineEncryption();
     // aplus §6-1 B1 — 서버 서비스 공개키가 알려져 있으면 machineKey 를 서버
@@ -260,7 +438,7 @@ export class ApiClient {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
+            'Authorization': `Bearer ${this.bearer()}`,
             'Content-Type': 'application/json',
             'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`
           },
@@ -433,6 +611,14 @@ export class ApiClient {
   }
 
   sessionSyncClient(session: Session): ApiSessionClient {
+    if (this.principal.kind === 'managed-session') {
+      applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
+      // The explicit mode, never inferred: it decides whether redirects are
+      // followed and which origin may see this bearer.
+      return new ApiSessionClient(
+        this.principal.attachment.scopedToken, session, this.principal.attachment.managed,
+      );
+    }
     // The session id is confirmed exactly here for every flavor (claude, codex,
     // gemini, openclaw, acp — online, reconnect-in-place, and offline→reconnect
     // all funnel through this factory before the agent loop starts), so export
@@ -440,11 +626,11 @@ export class ApiClient {
     // (specs/desktop-issue-pr-session-link R2). The confirmed current id wins
     // over stale values inherited from a parent or an earlier resume process.
     applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
-    return new ApiSessionClient(this.credential.token, session);
+    return new ApiSessionClient(this.bearer(), session);
   }
 
   machineSyncClient(machine: Machine): ApiMachineClient {
-    return new ApiMachineClient(this.credential.token, machine);
+    return new ApiMachineClient(this.bearer(), machine);
   }
 
   /**
@@ -458,7 +644,7 @@ export class ApiClient {
         { eventType, content },
         {
           headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
+            'Authorization': `Bearer ${this.bearer()}`,
             'Content-Type': 'application/json'
           },
           timeout: 10000
@@ -471,6 +657,11 @@ export class ApiClient {
   }
 
   push(): PushNotificationClient {
+    if (!this.pushClient) {
+      // There is no account here to notify, and the scoped bearer could not
+      // read an account's push tokens even if there were.
+      throw new Error('a managed session has no push notification client');
+    }
     return this.pushClient;
   }
 
@@ -487,7 +678,7 @@ export class ApiClient {
         },
         {
           headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
+            'Authorization': `Bearer ${this.bearer()}`,
             'Content-Type': 'application/json',
             'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`
           },
@@ -516,7 +707,7 @@ export class ApiClient {
         `${configuration.serverUrl}/v1/connect/${vendor}/token`,
         {
           headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
+            'Authorization': `Bearer ${this.bearer()}`,
             'Content-Type': 'application/json',
             'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`
           },
@@ -608,7 +799,7 @@ export class ApiClient {
         {},
         {
           headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
+            'Authorization': `Bearer ${this.bearer()}`,
             'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}`,
           },
           timeout: 3000,

@@ -5,6 +5,7 @@ import { AccountProfile } from "@/types";
 import { getPublicUrl } from "@/storage/files";
 import type { SessionMessageContent } from "@slopus/happy-wire";
 import { hasActiveUserScopedSocketIn, userScopedRoom } from "@/app/events/hasActiveUserScopedSocket";
+import { deliverManagedSession } from "@/app/api/socket/managed/managedDelivery";
 
 // === CONNECTION TYPES ===
 
@@ -241,6 +242,20 @@ class EventRouter {
         this.io = io;
     }
 
+    /**
+     * The managed socket server, when the deployment has one.
+     *
+     * Managed sockets are in none of the rooms below, so room fan-out reaches
+     * them not at all; they are addressed explicitly in `emit`. Keeping them
+     * out of the rooms is what makes the grant check possible — room delivery
+     * happens inside the adapter, past any point a check could sit.
+     */
+    initManaged(io: Server | null): void {
+        this.managedIo = io;
+    }
+
+    private managedIo: Server | null = null;
+
     // === CONNECTION MANAGEMENT (via Socket.IO rooms) ===
 
     addConnection(userId: string, connection: ClientConnection): void {
@@ -365,6 +380,18 @@ class EventRouter {
         skipSenderConnection?: ClientConnection;
     }): void {
         const rooms = this.getRoomsForFilter(params.userId, params.recipientFilter);
+
+        // Managed children of this session, addressed explicitly. Each packet
+        // is released by the replica holding the socket, after that replica
+        // re-reads the grant.
+        if (params.recipientFilter.type === 'all-interested-in-session') {
+            deliverManagedSession(this.managedIo, {
+                sessionId: params.recipientFilter.sessionId,
+                accountId: params.userId,
+                event: params.eventName,
+                args: [params.payload],
+            });
+        }
 
         if (params.skipSenderConnection) {
             params.skipSenderConnection.socket.broadcast.to(rooms).emit(params.eventName, params.payload);

@@ -20,12 +20,17 @@ import type { RawJSONLines } from './types'
 import {
     buildInitialPromptUserRecord,
     consumePendingInitialPrompt,
+    consumeConfirmedInitialPromptDelivery,
     consumePendingInitialPromptLocalId,
+    InitialPromptNotDurableError,
+    type ConfirmInitialPromptDelivery,
 } from '@/utils/initialPrompt'
 
 export {
   buildInitialPromptUserRecord,
   consumePendingInitialPrompt,
+  InitialPromptNotDurableError,
+  type ConfirmInitialPromptDelivery,
 } from '@/utils/initialPrompt'
 
 export interface InitialPromptSink {
@@ -39,6 +44,8 @@ export interface InitialPromptSink {
 export type PreparedClaudeInitialPrompt = {
   prompt: string | null
   localId?: string
+  /** The launcher asked for confirmed delivery; read once, at prepare time. */
+  requireConfirmedDelivery?: boolean
   exitAfterFirstTurn: boolean
 }
 
@@ -50,6 +57,7 @@ export function prepareClaudeInitialPrompt(input: {
 }): PreparedClaudeInitialPrompt {
   const consumedPrompt = consumePendingInitialPrompt(input.env)
   const localId = consumePendingInitialPromptLocalId(input.env)
+  const requireConfirmedDelivery = consumeConfirmedInitialPromptDelivery(input.env)
   const prompt = consumedPrompt
     && (!input.reconnectSessionId || input.allowAutomationReconnectPrompt)
     ? consumedPrompt
@@ -62,23 +70,89 @@ export function prepareClaudeInitialPrompt(input: {
   return {
     prompt,
     ...(prompt && localId ? { localId } : {}),
+    ...(requireConfirmedDelivery ? { requireConfirmedDelivery } : {}),
     exitAfterFirstTurn: input.automationRunOnceRequested && prompt !== null,
+  }
+}
+
+/**
+ * Refuses a start that cannot satisfy a required confirmed delivery.
+ *
+ * Called at the point the session decides to go offline, which returns long
+ * before the prepared-start helper runs — the helper's own check cannot reach
+ * that branch, so the condition is asserted where the branch is taken.
+ */
+export function assertClaudeConfirmedDeliveryPossible(input: {
+  prepared: PreparedClaudeInitialPrompt
+  serverAvailable: boolean
+}): void {
+  if (!input.prepared.requireConfirmedDelivery) return
+  if (!input.serverAvailable) {
+    throw new InitialPromptNotDurableError('no server session to confirm delivery against')
   }
 }
 
 export async function deliverPreparedClaudeSessionStart(input: {
   prepared: PreparedClaudeInitialPrompt
   sink: InitialPromptSink
+  /**
+   * Supplied only where the launcher asked for confirmed delivery. When
+   * present the turn does not begin until the prompt is acknowledged, so a
+   * message that never reached the server cannot be answered as if it had.
+   */
+  confirmDelivery?: ConfirmInitialPromptDelivery
   reportStarted?: () => Promise<void>
 }): Promise<boolean> {
   const prompt = input.prepared.prompt
   const localId = input.prepared.localId
+  const required = input.prepared.requireConfirmedDelivery === true
   input.prepared.prompt = null
+
+  // The option states a condition about the *initial prompt* landing durably.
+  // With no prompt, or nothing able to confirm one, that condition cannot be
+  // met — so the launch is refused rather than quietly downgraded. A future
+  // continuation path is a separate contract, not an implicit exemption.
+  if (required && !prompt) {
+    throw new InitialPromptNotDurableError('confirmed delivery required but no initial prompt')
+  }
+  if (required && !input.confirmDelivery) {
+    throw new InitialPromptNotDurableError('confirmed delivery required but no confirmer is available')
+  }
+
   if (prompt) {
-    deliverInitialPrompt(prompt, input.sink, localId)
+    if (input.confirmDelivery) {
+      // Nothing to correlate an acknowledgement with means no confirmed
+      // delivery is possible, and a caller that asked for one must not get
+      // the unconfirmed behaviour silently.
+      if (!localId) throw new InitialPromptNotDurableError('missing localId')
+      // Registered before the enqueue: a flush can begin the moment the record
+      // is queued, and a waiter added afterwards would miss its own ack.
+      const pending = input.confirmDelivery(localId)
+      // The record goes through the ordinary outbox; only the push waits.
+      input.sink.sendClaudeSessionMessage(buildInitialPromptUserRecord(prompt, input.sink.sessionId), localId)
+      input.sink.recordAppPrompt(prompt)
+      const ack = await pending
+      if (!ack.ok) throw new InitialPromptNotDurableError(ack.reason ?? 'unknown')
+      pushInitialPrompt(prompt, input.sink)
+    } else {
+      deliverInitialPrompt(prompt, input.sink, localId)
+    }
   }
   await input.reportStarted?.()
   return prompt !== null
+}
+
+/** Starts the turn. Split out so the confirmed path can defer only this half. */
+function pushInitialPrompt(prompt: string, sink: InitialPromptSink): void {
+  let pushText = prompt
+  if (!sink.hasTitle()) {
+    const withTitle = appendTitleInstruction(pushText)
+    if (withTitle !== pushText) {
+      pushText = withTitle
+      sink.recordAppPrompt(pushText)
+    }
+  }
+  sink.pushPrompt(pushText)
 }
 
 export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink, localId?: string): void {
@@ -89,13 +163,5 @@ export function deliverInitialPrompt(prompt: string, sink: InitialPromptSink, lo
 
   // (a) 턴 시작. 새 세션엔 제목이 없으므로 onUserMessage와 동일하게 모델 사본에만
   // 제목 지시를 덧붙이고, 변형본도 dedupe 스탬프한다.
-  let pushText = prompt
-  if (!sink.hasTitle()) {
-    const withTitle = appendTitleInstruction(pushText)
-    if (withTitle !== pushText) {
-      pushText = withTitle
-      sink.recordAppPrompt(pushText)
-    }
-  }
-  sink.pushPrompt(pushText)
+  pushInitialPrompt(prompt, sink)
 }

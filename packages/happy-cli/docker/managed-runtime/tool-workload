@@ -1,0 +1,12 @@
+#!/bin/sh
+# The trusted helper's `execve` target.
+#
+# It is a shell stub rather than the workload itself because the helper checks
+# the file it is about to exec — root-owned, no group or other write — and that
+# check is only meaningful on a file nothing in the running image can replace.
+# A `node` invocation with arguments would move that decision into a string the
+# caller supplies.
+#
+# The working directory is already the run's workspace: the helper chdir'd
+# there before dropping privileges, and this must not change it.
+exec /usr/local/bin/node /usr/local/lib/saycode/tool-workload.mjs

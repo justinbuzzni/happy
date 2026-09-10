@@ -13,11 +13,17 @@ import type { AgentState, Metadata, Session } from '@/api/types';
 import { configuration } from '@/configuration';
 import { createOfflineSessionStub } from '@/utils/offlineSessionStub';
 import { startOfflineReconnection } from '@/utils/serverConnectionErrors';
+import { resolveManagedOfflineFallback } from '@/managed/managedStartup';
 
 /**
  * Options for setting up offline reconnection.
  */
 export interface SetupOfflineReconnectionOptions {
+    /**
+     * Whether this is a managed Cloud run. Such a run may not create a session
+     * of its own — the parent holds the only key for the one it was given.
+     */
+    managedRun?: boolean;
     /** API client instance */
     api: ApiClient;
     /** Unique session tag */
@@ -76,6 +82,7 @@ export interface SetupOfflineReconnectionResult {
  */
 export function setupOfflineReconnection(opts: SetupOfflineReconnectionOptions): SetupOfflineReconnectionResult {
     const { api, sessionTag, metadata, state, response, onSessionSwap } = opts;
+    const managedRun = opts.managedRun === true;
 
     let session: ApiSessionClient;
     let reconnectionHandle: ReturnType<typeof startOfflineReconnection<ApiSessionClient>> | null = null;
@@ -89,6 +96,10 @@ export function setupOfflineReconnection(opts: SetupOfflineReconnectionOptions):
         reconnectionHandle = startOfflineReconnection<ApiSessionClient>({
             serverUrl: configuration.serverUrl,
             onReconnected: async () => {
+                // A managed run has no session of its own to make: the parent
+                // created one and holds the only key for it. Creating another
+                // here would produce work nobody can read.
+                resolveManagedOfflineFallback(managedRun);
                 const resp = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
                 if (!resp) throw new Error('Server unavailable');
                 const realSession = api.sessionSyncClient(resp);

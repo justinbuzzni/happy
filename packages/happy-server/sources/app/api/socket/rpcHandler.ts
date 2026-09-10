@@ -3,6 +3,10 @@ import { Server, Socket } from "socket.io";
 import type { RemoteSocket } from "socket.io";
 import type { DefaultEventsMap } from "socket.io/dist/typed-events";
 import { Counter, Histogram, register } from 'prom-client';
+import { randomUUID } from 'node:crypto';
+import { dispatchManagedRpc, managedRpcServer } from '@/app/api/socket/managed/managedDelivery';
+import { isManagedSessionId, splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
+import { dispatchDaemonRpc } from '@/app/api/socket/managedDaemonRpcRelay';
 
 // RPC routing uses Socket.IO rooms. A daemon registering method M for user U
 // joins room `rpc:U:M`. Callers look the daemon up cross-replica via
@@ -185,6 +189,44 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 return;
             }
 
+            // A managed session is answered only by its managed socket. The
+            // legacy room below is addressed by a name a child once claimed,
+            // so falling back to it when the child is offline or its grant was
+            // revoked would hand that session's calls to whoever holds the
+            // name now. `isManagedSessionId` is durable for exactly that
+            // reason: the answer does not change when the child goes away.
+            const parsed = splitRpcMethod(method);
+            if (parsed && await isManagedSessionId(parsed.sessionId)) {
+                const dispatched = await dispatchManagedRpc(managedRpcServer(), {
+                    sessionId: parsed.sessionId,
+                    accountId: userId,
+                    rpcName: parsed.name,
+                    requestId: randomUUID(),
+                    params,
+                    // The caller's deadline applies here exactly as it does on
+                    // the legacy path; taking the managed branch must not mean
+                    // waiting forever.
+                }, undefined, { deadlineMs: timeoutMs });
+                if (!dispatched.ok) {
+                    // Same envelope the legacy path answers with: the caller is
+                    // an ordinary account client and cannot be asked to learn a
+                    // second shape because the session happens to be managed.
+                    finish(dispatched.reason === 'no-target' ? 'not_available'
+                        : dispatched.reason === 'timeout' ? 'timeout' : 'failed');
+                    callback?.({
+                        ok: false,
+                        error: dispatched.error ?? 'RPC method not available',
+                    });
+                    return;
+                }
+                finish('success');
+                // `result` is whatever the child acknowledged with — an opaque
+                // encrypted string from its RPC handler manager. It is passed
+                // through, not interpreted.
+                callback?.({ ok: true, result: dispatched.result });
+                return;
+            }
+
             // 1. Find the daemon socket(s) cross-replica via the adapter.
             // If the room is empty OR fetchSockets fails (peer replica
             // unresponsive — fetchRoomSockets logs and returns []) fall
@@ -209,6 +251,39 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             if (target.id === socket.id) {
                 finish('self_call');
                 callback?.({ ok: false, error: 'Cannot call RPC on the same socket' });
+                return;
+            }
+
+            /*
+             * A managed runtime is dispatched through the relay, not through a
+             * broadcast ack.
+             *
+             * `emitWithAck` on a `RemoteSocket` sends nothing from here: the
+             * adapter publishes, and the replica that owns the socket delivers
+             * it later without consulting anything. A check on this side would
+             * therefore describe the past — a grant withdrawn during that gap
+             * would not stop the request. The relay re-reads the authority on
+             * the replica that actually emits, immediately before it does, with
+             * the socket id fixed and no re-selection anywhere.
+             */
+            if (target.data?.managedDaemon) {
+                const outcome = await dispatchDaemonRpc({
+                    io,
+                    request: {
+                        requestId: randomUUID(),
+                        targetSocketId: target.id,
+                        method,
+                        params,
+                        timeoutMs,
+                    },
+                });
+                if (outcome.ok) {
+                    finish('ok');
+                    callback?.({ ok: true, result: outcome.result });
+                    return;
+                }
+                finish(outcome.reason === 'refused' ? 'not_available' : 'error');
+                callback?.({ ok: false, error: 'RPC method not available' });
                 return;
             }
 

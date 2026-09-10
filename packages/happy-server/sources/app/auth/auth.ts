@@ -1,5 +1,6 @@
 import * as privacyKit from "privacy-kit";
 import { log } from "@/utils/log";
+import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScopedToken";
 
 /** Cache entries expire after 24 hours */
 const TOKEN_CACHE_TTL = 24 * 60 * 60 * 1000;
@@ -138,6 +139,36 @@ class AuthModule {
         }
     }
     
+    /**
+     * Resolves a bearer into one of the two principal kinds.
+     *
+     * The account verifier runs first and unchanged, so every existing BYOS
+     * path behaves exactly as before. Only a bearer it rejects is offered to
+     * the scoped issuer, and a scoped result is never folded into the account
+     * shape — the caller has to decide what a managed session may do.
+     *
+     * With no issuer configured the scoped kind does not exist at all: that is
+     * the default, and it is what keeps this off until a control plane is
+     * actually wired.
+     */
+    async resolvePrincipal(
+        token: string,
+        options: { scopedIssuer?: Pick<SessionScopedTokenIssuer, 'verify'>; now?: number } = {},
+    ): Promise<Principal | null> {
+        const account = await this.verifyToken(token);
+        if (account) {
+            return {
+                kind: 'account',
+                accountId: account.userId,
+                ...(account.extras !== undefined ? { extras: account.extras } : {}),
+            };
+        }
+        if (!options.scopedIssuer) return null;
+
+        const scoped = await options.scopedIssuer.verify(token, options.now ?? Date.now());
+        return scoped.ok ? { kind: 'managed-session', claims: scoped.claims } : null;
+    }
+
     invalidateUserTokens(userId: string): void {
         // Remove all tokens for a specific user
         // This is expensive but rarely needed

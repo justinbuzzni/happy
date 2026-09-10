@@ -4192,3 +4192,56 @@ describe('CodexAppServerClient sandbox integration', () => {
         await client.disconnect();
     });
 });
+
+/**
+ * A managed Cloud run configures its own provider, and only its own.
+ *
+ * Account rotation exists to spread load across the operator's own Codex
+ * accounts. For a managed run that is a different payer and a provider outside
+ * the approval, so it must not be consulted at all — consulting it has already
+ * started a proxy and picked an account by the time anything could override it.
+ */
+describe('CodexAppServerClient for a managed Cloud run', () => {
+    const MANAGED_ARGS = [
+        '-c', 'model_providers.saycode-managed.name="Saycode managed gateway"',
+        '-c', 'model_providers.saycode-managed.base_url="https://studio.example.test/api/cloud/gateway/openai/v1"',
+        '-c', 'model_providers.saycode-managed.env_key="OPENAI_API_KEY"',
+        '-c', 'model_providers.saycode-managed.requires_openai_auth=false',
+        '-c', 'model_providers.saycode-managed.wire_api="responses"',
+        '-c', 'model_provider="saycode-managed"',
+    ];
+
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mockExecSync.mockReturnValue('codex-cli 0.140.0');
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({
+            args: ['-c', 'model_provider="codex-multi-auth"'],
+            env: { OPENAI_API_KEY: 'another-accounts-key' },
+            cleanup: mockProxyCleanup,
+        });
+        mockProxyCleanup.mockResolvedValue(undefined);
+        mockSpawn.mockImplementation(() => createMockProcess());
+    });
+
+    it('never consults account rotation, and starts with the managed provider', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient(undefined, undefined, undefined, MANAGED_ARGS);
+        await client.connect();
+
+        expect(mockPrepareCodexMultiAuthProxy).not.toHaveBeenCalled();
+        const [, args] = mockSpawn.mock.calls[0];
+        for (const expected of MANAGED_ARGS) expect(args).toContain(expected);
+        // Not the rotation's provider, and not whatever the config file says.
+        expect(args).not.toContain('model_provider="codex-multi-auth"');
+    });
+
+    it('still uses account rotation for an ordinary run', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        await client.connect();
+
+        expect(mockPrepareCodexMultiAuthProxy).toHaveBeenCalled();
+        const [, args] = mockSpawn.mock.calls[0];
+        expect(args).toContain('model_provider="codex-multi-auth"');
+    });
+});

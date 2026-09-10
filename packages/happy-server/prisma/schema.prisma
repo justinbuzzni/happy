@@ -873,3 +873,239 @@ model VoiceConversation {
 
     @@index([accountId, createdAt(sort: Desc)])
 }
+
+//
+// Managed session authority (T04-B)
+//
+// Happy has no Run table of its own: the control plane owns run lifecycle and
+// projects the parts this server must enforce. These three models are that
+// projection plus the grants issued against it. Nothing here decides policy —
+// the control plane does, under a signed assertion — but every scoped action is
+// checked against these rows, so a stale or revoked grant stops working here.
+//
+
+/// Workspace-level authority. Ownership binding (tenant/project/workspace) is
+/// immutable once created; the Happy account a run acts as is NOT pinned here,
+/// because the same project may legitimately run under a different account
+/// later — that lives on the grant and on the run.
+model ManagedWorkspaceAuthority {
+    workspaceId String @id
+    tenantId    String
+    projectId   String
+    /// Runtime generation. A grant minted below the current epoch is refused
+    /// immediately, without waiting for its own expiry.
+    epoch       Int
+    runtimeId   String
+    /// Monotonic. Advances on every accepted projection update and is the CAS
+    /// token the control plane sends as `expectedVersion`.
+    version     Int    @default(0)
+    /// Canonical digest of the body that produced the current version, so an
+    /// identical retry is idempotent and a different body at the same version
+    /// is a conflict rather than a silent overwrite.
+    bodyDigest  String
+    createdAt   BigInt
+    updatedAt   BigInt
+
+    runs   ManagedRunAuthority[]
+    grants ManagedSessionGrant[]
+
+    @@index([tenantId, projectId])
+}
+
+/// Per-run authority. Attempt history and cancellation move independently of
+/// the workspace, so this carries its own monotonic version.
+model ManagedRunAuthority {
+    runId       String @id
+    workspaceId String
+    /// The Happy account this run acts as, pinned here rather than on the
+    /// workspace: the same project may legitimately run under a different
+    /// account later. Every grant is checked against this and against
+    /// `Session.accountId`, so a grant cannot outlive a change of actor.
+    accountId   String
+    /// The only attempt that may hold a live grant.
+    currentAttemptId String
+    /// Terminal. Once set, no grant may be issued for this run under any
+    /// attempt or family — a cancelled run must not come back under a new id.
+    cancelledAt BigInt?
+    version     Int    @default(0)
+    bodyDigest  String
+    createdAt   BigInt
+    updatedAt   BigInt
+
+    workspace ManagedWorkspaceAuthority @relation(fields: [workspaceId], references: [workspaceId], onDelete: Restrict)
+    grants    ManagedSessionGrant[]
+
+    @@index([workspaceId])
+    @@index([accountId])
+}
+
+/// One scoped credential. `family` is stable per (run, attempt, session) so a
+/// renewal replaces its predecessor in place and a revoke tombstones the whole
+/// family — issuing a fresh `grantId` cannot resurrect what was revoked.
+/**
+ * The highest ACL generation this server has seen for one viewer of one
+ * session, and the compare-and-set point for every read-grant write.
+ *
+ * The parent owns the ACL and numbers its changes; this row is what makes a
+ * *late* message from that parent harmless. Control-plane calls arrive over a
+ * network that reorders, and both directions are dangerous: an old mint would
+ * hand back access that was withdrawn, and an old revoke would withdraw access
+ * that was re-granted. Comparing against the high-water mark refuses both,
+ * whichever order they arrive in.
+ *
+ * Keyed per (session, viewer) rather than per project: a project-wide counter
+ * would make any ACL change anywhere invalidate every session's read grants.
+ */
+model ManagedReadAclWatermark {
+    sessionId       String
+    viewerAccountId String
+    /// Monotonic. Advanced by a mint or a revoke, never lowered, never reset.
+    revision        Int
+    updatedAt       BigInt
+
+    @@id([sessionId, viewerAccountId])
+}
+
+model ManagedSessionGrant {
+    grantId     String @id
+    family      String
+    /**
+     * The run axes a **runner** grant is bound to.
+     *
+     * Null for a `transcript-read` grant, and that is the point: a transcript
+     * outlives the run that produced it. A finished run, a stopped runtime and
+     * a session that has since been replaced all still have transcripts
+     * somebody is entitled to read, and requiring a live run to read one is
+     * what made a dormant project unreadable.
+     */
+    workspaceId String?
+    runId       String?
+    attemptId   String?
+    sessionId   String
+    /// What this grant is **for**, and therefore what it may reach.
+    ///
+    /// Without it a grant handed to a browser for reading is the same object a
+    /// runner uses to post messages and register tools — that is, giving
+    /// somebody a transcript would give them execution on that session.
+    ///
+    /// `runner` is the historical behaviour and stays the default so existing
+    /// rows and callers keep working. An unknown value is never folded into it:
+    /// folding an unrecognised purpose into `runner` turns "we do not know what
+    /// this is for" into full execution.
+    ///
+    /// 'runner' | 'transcript-read' | 'approval-control'
+    purpose     String @default("runner")
+    /// The account this run acts as. Compared against `Session.accountId` on
+    /// every action; never inherited from the workspace.
+    /// The account that owns the session. For a runner grant this is also the
+    /// account the run acts as; for a read grant it is the authority the
+    /// request is checked against, never a value the caller may assert.
+    accountId   String
+    /// Who is reading, when that is not the owner.
+    ///
+    /// A company project may be read by a member whose Happy account is not
+    /// the session owner's. Null on a runner grant, where there is no separate
+    /// viewer.
+    viewerAccountId String?
+    /// The session key envelope resealed for `viewerAccountId`.
+    ///
+    /// Produced by whoever holds the plaintext key — this server never does,
+    /// and never invents one. Absent means the viewer cannot decrypt, which is
+    /// reported as such rather than papered over with the owner's envelope.
+    viewerDataEncryptionKey Bytes?
+    epoch       Int?
+    /// Authority versions this grant was minted against. A later projection
+    /// update makes the grant stale without needing to touch this row.
+    workspaceAuthorityVersion Int?
+    runAuthorityVersion       Int?
+    expiresAt   BigInt
+    revokedAt   BigInt?
+    /// Reason code only — never provider text or request content.
+    revokedReason String?
+    /// Set on a tombstone created by a revoke that arrived before any issue.
+    tombstone   Boolean @default(false)
+    /// The ACL generation a **read** grant was issued under.
+    ///
+    /// Part of the family, so a member removed and later re-added is issued
+    /// against a different row than the one their removal tombstoned. Without
+    /// it, re-adding somebody could only be made to work by clearing that
+    /// tombstone — which would resurrect the bearer the removal withdrew.
+    /// Null on a runner or approval grant, which are bound to a run instead.
+    aclRevision Int?
+    /// Monotonic renewal counter. A renewal supersedes the grant in place, so
+    /// this is the compare-and-set token that keeps two control-plane replicas
+    /// from both extending the same grant.
+    renewalSeq  Int    @default(0)
+    /// The control-plane request that produced this row, for exact-body retry.
+    requestId   String
+    bodyDigest  String
+    createdAt   BigInt
+    updatedAt   BigInt
+
+    /// Optional because a read grant has no run: the transcript outlives it.
+    workspace ManagedWorkspaceAuthority? @relation(fields: [workspaceId], references: [workspaceId], onDelete: Restrict)
+    run       ManagedRunAuthority?       @relation(fields: [runId], references: [runId], onDelete: Restrict)
+
+    /// At most one live grant per family: a renewal supersedes in place.
+    @@unique([family])
+    @@unique([requestId])
+    @@index([sessionId, revokedAt])
+    @@index([runId, attemptId])
+    @@index([workspaceId, epoch])
+}
+
+/// The durable identity a managed Cloud daemon runs on.
+///
+/// A managed runtime has no human and no account of its own. The Machine it
+/// registers as belongs to a customer's account, but the daemon must never
+/// hold that account's bearer: it runs code the customer's agent can
+/// influence, and an account bearer reaches every session on that account.
+/// This row is what its own credential names.
+///
+/// Separate from key custody on purpose. This answers "is this daemon still
+/// allowed to act"; the Machine's wrapped key answers "what can it read".
+/// Revoking one does not silently invalidate the other, which is why both
+/// exist.
+model ManagedDaemonGrant {
+    daemonGrantId String @id
+    /// The account the Machine belongs to. Named by the credential, never
+    /// acted as.
+    accountId     String
+    machineId     String
+    runtimeId     String
+    provisioningOperationId String
+    workspaceId   String
+    projectId     String
+    /// The runtime generation this grant was issued for.
+    epoch         Int
+    /// Moved by a revocation. A credential from an older generation is refused
+    /// even while this row still exists, so a withdrawal takes effect without
+    /// waiting for a token to expire.
+    generation    Int    @default(0)
+    /// When the *grant* stops being usable. The credentials minted against it
+    /// carry their own, shorter, expiry.
+    expiresAt     BigInt
+    revokedAt     BigInt?
+    /// Reason code only — never provider text or request content.
+    revokedReason String?
+    /// The control-plane request that **created** this row, for exact-body
+    /// retry. Immutable: a renewal that overwrote it would make the original
+    /// issue retry miss its own row and collide on the unique index instead of
+    /// converging.
+    requestId     String
+    bodyDigest    String
+    /// The most recent renewal request, on its own axis so a renewal retry
+    /// converges the same way an issue retry does.
+    renewalRequestId String?
+    renewalBodyDigest String?
+    createdAt     BigInt
+    updatedAt     BigInt
+
+    /// One live grant per runtime generation: a re-issue supersedes in place
+    /// rather than leaving two credentials that both look current.
+    @@unique([runtimeId, provisioningOperationId])
+    @@unique([requestId])
+    @@unique([renewalRequestId])
+    @@index([accountId, machineId])
+    @@index([workspaceId, epoch])
+}

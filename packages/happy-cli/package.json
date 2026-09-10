@@ -60,6 +60,16 @@
     },
     "./browserSessionBrokerMain": {
       "import": "./dist/browserSessionBrokerMain.mjs"
+    },
+    "./managed/image": {
+      "require": {
+        "types": "./dist/managed/imageRuntimeEntry.d.cts",
+        "default": "./dist/managed/imageRuntimeEntry.cjs"
+      },
+      "import": {
+        "types": "./dist/managed/imageRuntimeEntry.d.mts",
+        "default": "./dist/managed/imageRuntimeEntry.mjs"
+      }
     }
   },
   "files": [

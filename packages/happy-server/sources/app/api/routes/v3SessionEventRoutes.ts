@@ -5,6 +5,7 @@ import { SESSION_EVENT_TYPES, type SessionEventType } from "@/app/events/session
 import { db } from "@/storage/db";
 import { z } from "zod";
 import { type Fastify } from "../types";
+import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
 
 const validEventTypes = Object.values(SESSION_EVENT_TYPES) as [string, ...string[]];
 
@@ -71,8 +72,10 @@ function toResponseEvent(event: SelectedEvent) {
 }
 
 export function v3SessionEventRoutes(app: Fastify) {
+    // GET only. The POST below writes session events, which no managed
+    // consumer needs, so sharing a path does not carry it in.
     app.get('/v3/sessions/:sessionId/events', {
-        preHandler: app.authenticate,
+        preHandler: requireSessionScopeAuth(app) as never,
         schema: {
             params: z.object({
                 sessionId: z.string(),

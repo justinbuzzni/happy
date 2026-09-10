@@ -5,7 +5,16 @@ import path from 'node:path'
 import http, { IncomingMessage, ServerResponse } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { createPortRegistry } from './portRegistry'
-import { startDaemonControlServer } from './controlServer'
+import { startDaemonControlServer, type ManagedReportClaim } from './controlServer'
+import { createManagedLaunchRegistry } from './launch/managedLaunchRegistry'
+import {
+  MANAGED_REPORT_CAPABILITY_HEADER,
+  mintManagedReportCapability,
+} from './launch/managedReportCapability'
+import { createManagedReportVerifier } from './launch/verifyManagedReport'
+import { randomBytes } from 'node:crypto'
+
+const LAUNCH_SECRET = randomBytes(32)
 import type { SpawnSessionOptions } from '@/modules/common/registerCommonHandlers'
 
 const realFetch = globalThis.fetch
@@ -927,3 +936,185 @@ describe('controlServer authentication', () => {
     expect(res.status).toBe(200)
   })
 })
+
+describe('managed runtime report paths — real HTTP, per-launch capability only', () => {
+    const NOW = 1_800_000_000_000;
+    let dir: string;
+    let baseUrl: string;
+    let stopServer: () => Promise<void>;
+    let controlSecret = '';
+    let registry: ReturnType<typeof createManagedLaunchRegistry>;
+    const started: Array<{ sessionId: string }> = [];
+
+    /**
+     * registry 를 먼저 만들어 등록하고, **그 인스턴스로** verifier 를 만든 뒤
+     * 부팅한다. 예전 순서(verifier 를 만든 다음 boot 안에서 registry 재생성)는
+     * verifier 가 이전 테스트의 registry 를 붙잡거나 undefined 를 잡아, 이 파일
+     * 전체를 돌릴 때만 우연히 통과하는 테스트를 만들었다.
+     */
+    function makeRegistry() {
+        const created = createManagedLaunchRegistry();
+        created.register({
+            launchId: 'launch-1',
+            scope: {
+                operationKey: 'op-1', runId: 'run-1', attemptId: 'attempt-1',
+                epoch: 3, workspaceId: 'ws-1', projectId: 'project-1',
+            },
+            sessionId: 'session-1',
+            hostPids: [4242],
+            encryption: { encryptionKey: 'key-1', encryptionVariant: 'dataKey' },
+            expiresAt: NOW + 60_000,
+            secret: LAUNCH_SECRET,
+        });
+        return created;
+    }
+
+    async function boot(makeVerifier?: (
+        reg: ReturnType<typeof createManagedLaunchRegistry>,
+    ) => (claim: ManagedReportClaim) => { ok: true } | { ok: false; reason: string }) {
+        registry = makeRegistry();
+        const sync = makeVerifier ? makeVerifier(registry) : undefined;
+        // 검증기는 메모리 원장만 보므로 동기다. control server 의 의존성은
+        // Promise 계약이고 호출부가 `await` 한다 — 여기서 감싸는 것이 그 사실을
+        // 있는 그대로 옮기는 방법이다. 계약을 넓혀 동기 함수를 받게 만들면
+        // 나중에 durable 원장으로 바뀔 때 그 차이가 조용히 사라진다.
+        const verifier = sync ? async (claim: ManagedReportClaim) => sync(claim) : undefined;
+        const ports = createPortRegistry({
+            filePath: path.join(dir, 'port-registry.json'),
+            portMin: 30000, portMax: 30010, isPortBindable: async () => true,
+        });
+        const server = await startDaemonControlServer({
+            getChildren: () => [],
+            stopSession: () => ({ stopped: false, reason: 'not-found' }),
+            spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+            requestShutdown: () => {},
+            onHappySessionWebhook: (sessionId) => { started.push({ sessionId }) },
+            portRegistry: ports,
+            managedRuntime: true,
+            ...(verifier ? { verifyManagedReport: verifier } : {}),
+        });
+        baseUrl = `http://127.0.0.1:${server.port}`;
+        stopServer = server.stop;
+        controlSecret = server.controlSecret;
+    }
+
+    function post(pathname: string, body: unknown, headers: Record<string, string> = {}) {
+        return realFetch(`${baseUrl}${pathname}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...headers },
+            body: JSON.stringify(body),
+        });
+    }
+
+    function capabilityFor(body: unknown, over: { seq?: number; kind?: 'session-started' | 'session-runtime' } = {}) {
+        return mintManagedReportCapability({
+            secret: LAUNCH_SECRET, launchId: 'launch-1',
+            kind: over.kind ?? 'session-started', seq: over.seq ?? 1,
+            expiresAt: NOW + 60_000, body,
+        });
+    }
+
+    const STARTED_BODY = {
+        sessionId: 'session-1',
+        metadata: { hostPid: 4242, path: '/workspace/project' },
+        encryption: {
+            encryptionKey: 'key-1', encryptionVariant: 'dataKey',
+            seq: 1, metadataVersion: 1, agentStateVersion: 1,
+        },
+    };
+
+    beforeEach(() => {
+        started.length = 0;
+        dir = mkdtempSync(path.join(tmpdir(), 'control-server-managed-'));
+    });
+
+    afterEach(async () => {
+        await stopServer();
+        rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('refuses a lifecycle report when no verifier is wired — activation stays closed', async () => {
+        await boot();
+        const res = await post('/session-started', STARTED_BODY, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capabilityFor(STARTED_BODY),
+        });
+        expect(res.status).toBe(403);
+        expect(started).toHaveLength(0);
+    });
+
+    it('does not accept the daemon-wide control secret in place of a capability', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const res = await post('/session-started', STARTED_BODY, {
+            Authorization: `Bearer ${controlSecret}`,
+        });
+        // 전역 secret 은 어느 launch 인지 증명하지 못한다.
+        expect(res.status).toBe(403);
+        expect(started).toHaveLength(0);
+    });
+
+    it('accepts a report carrying a valid per-launch capability and no bearer', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const res = await post('/session-started', STARTED_BODY, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capabilityFor(STARTED_BODY),
+        });
+        expect(res.status).toBe(200);
+        expect(started).toEqual([{ sessionId: 'session-1' }]);
+    });
+
+    it('refuses the same report replayed on the wire', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const capability = capabilityFor(STARTED_BODY);
+        expect((await post('/session-started', STARTED_BODY, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capability,
+        })).status).toBe(200);
+        const replayed = await post('/session-started', STARTED_BODY, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capability,
+        });
+        expect(replayed.status).toBe(403);
+        expect(started).toHaveLength(1);
+    });
+
+    it('refuses a body whose hostPid was swapped after signing', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const capability = capabilityFor(STARTED_BODY);
+        const res = await post(
+            '/session-started',
+            { ...STARTED_BODY, metadata: { hostPid: 9999, path: '/workspace/project' } },
+            { [MANAGED_REPORT_CAPABILITY_HEADER]: capability },
+        );
+        expect(res.status).toBe(403);
+        expect(started).toHaveLength(0);
+    });
+
+    it('refuses a launch reporting a session it was not registered for', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const body = { ...STARTED_BODY, sessionId: 'session-other' };
+        const res = await post('/session-started', body, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capabilityFor(body),
+        });
+        expect(res.status).toBe(403);
+        expect(started).toHaveLength(0);
+    });
+
+    it('refuses a hostPid that is present but not a positive safe integer', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const body = {
+            ...STARTED_BODY,
+            metadata: { hostPid: '4242', path: '/workspace/project' },
+        };
+        const res = await post('/session-started', body, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capabilityFor(body),
+        });
+        expect(res.status).toBe(403);
+        expect(started).toHaveLength(0);
+    });
+
+    it('still refuses every non-report control path on a managed runtime', async () => {
+        await boot((reg) => createManagedReportVerifier({ registry: reg, now: () => NOW }));
+        const res = await post('/spawn-session', { directory: '/workspace/project' }, {
+            [MANAGED_REPORT_CAPABILITY_HEADER]: capabilityFor(STARTED_BODY),
+        });
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ code: 'MANAGED_CAPABILITY_REQUIRED' });
+    });
+});

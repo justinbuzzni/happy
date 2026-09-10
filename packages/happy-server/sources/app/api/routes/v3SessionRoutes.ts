@@ -4,6 +4,7 @@ import { allocateSessionSeqBatch, allocateUserSeq } from "@/storage/seq";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { z } from "zod";
 import { type Fastify } from "../types";
+import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
 
 // Pagination contract:
 //   - after_seq=N  → forward sync: messages with seq > N, ordered ASC.
@@ -62,8 +63,10 @@ function toSendResponseMessage(message: Omit<SelectedMessage, "content">) {
 }
 
 export function v3SessionRoutes(app: Fastify) {
+    // Reachable by a managed child for its own session. The ownership query
+    // below is unchanged and still applies; the decorator adds the grant.
     app.get('/v3/sessions/:sessionId/messages', {
-        preHandler: app.authenticate,
+        preHandler: requireSessionScopeAuth(app) as never,
         schema: {
             params: z.object({
                 sessionId: z.string()
@@ -121,7 +124,7 @@ export function v3SessionRoutes(app: Fastify) {
     });
 
     app.post('/v3/sessions/:sessionId/messages', {
-        preHandler: app.authenticate,
+        preHandler: requireSessionScopeAuth(app) as never,
         schema: {
             params: z.object({
                 sessionId: z.string()

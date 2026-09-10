@@ -196,3 +196,166 @@ describe('deliverPreparedClaudeSessionStart', () => {
     expect(events).toEqual(['record-prompt', 'queue-prompt', 'report-started'])
   })
 })
+
+describe('confirmed delivery on the prepared start path', () => {
+  function confirmedSink(outcome: { ok: boolean; reason?: string }, overrides: Partial<InitialPromptSink> = {}) {
+    const base = makeSink(overrides)
+    const confirmCalls: string[] = []
+    return {
+      ...base,
+      confirmCalls,
+      confirmDelivery: async (localId: string) => {
+        confirmCalls.push(localId)
+        return outcome as never
+      },
+    }
+  }
+
+  it('pushes the prompt only after the message is acknowledged', async () => {
+    const h = confirmedSink({ ok: true })
+    const order: string[] = []
+    const sink: InitialPromptSink = {
+      ...h.sink,
+      sendClaudeSessionMessage: () => { order.push('sent') },
+      pushPrompt: () => { order.push('pushed') },
+    }
+    const reported: string[] = []
+
+    await deliverPreparedClaudeSessionStart({
+      prepared: { prompt: '배포 확인', localId: 'local-1', exitAfterFirstTurn: false },
+      sink,
+      confirmDelivery: h.confirmDelivery,
+      reportStarted: async () => { reported.push('reported') },
+    })
+
+    expect(order).toEqual(['sent', 'pushed'])
+    expect(h.confirmCalls).toEqual(['local-1'])
+    expect(reported).toEqual(['reported'])
+  })
+
+  it('throws without pushing or reporting when the acknowledgement never came', async () => {
+    const h = confirmedSink({ ok: false, reason: 'deadline' })
+    const reported: string[] = []
+
+    await expect(deliverPreparedClaudeSessionStart({
+      prepared: { prompt: '배포 확인', localId: 'local-1', exitAfterFirstTurn: false },
+      sink: h.sink,
+      confirmDelivery: h.confirmDelivery,
+      reportStarted: async () => { reported.push('reported') },
+    })).rejects.toThrowError(/durability/)
+
+    // The turn must not begin on a message whose durability is unknown.
+    expect(h.pushed).toEqual([])
+    expect(reported).toEqual([])
+  })
+
+  it('fails closed when a confirmed delivery was asked for without a localId', async () => {
+    const h = confirmedSink({ ok: true })
+    await expect(deliverPreparedClaudeSessionStart({
+      prepared: { prompt: '배포 확인', exitAfterFirstTurn: false },
+      sink: h.sink,
+      confirmDelivery: h.confirmDelivery,
+    })).rejects.toThrowError(/localId/)
+    expect(h.pushed).toEqual([])
+  })
+
+  it('does not revive the push if the acknowledgement arrives after the deadline', async () => {
+    let late: (() => void) | null = null
+    const h = makeSink()
+    const confirm = async () => {
+      // Resolves as unknown now; a later real ack cannot re-enter this path.
+      await new Promise<void>((resolve) => { late = resolve })
+      return { ok: false, reason: 'deadline' } as never
+    }
+    const pending = deliverPreparedClaudeSessionStart({
+      prepared: { prompt: 'x', localId: 'local-1', exitAfterFirstTurn: false },
+      sink: h.sink,
+      confirmDelivery: confirm,
+    })
+    late!()
+    await expect(pending).rejects.toThrow()
+    expect(h.pushed).toEqual([])
+  })
+
+  it('registers the waiter before the message is enqueued', async () => {
+    // A real flush can complete synchronously inside the send. If the waiter
+    // were registered afterwards it would never see its own acknowledgement.
+    let resolveAck: ((v: { ok: boolean }) => void) | null = null
+    let registeredBeforeSend = false
+    const h = makeSink({
+      sendClaudeSessionMessage: () => {
+        registeredBeforeSend = resolveAck !== null
+        resolveAck?.({ ok: true })
+      },
+    })
+    const confirmDelivery = (_localId: string) => new Promise<{ ok: boolean }>((resolve) => {
+      resolveAck = resolve
+    })
+
+    await deliverPreparedClaudeSessionStart({
+      prepared: { prompt: 'x', localId: 'local-1', exitAfterFirstTurn: false },
+      sink: h.sink,
+      confirmDelivery,
+    })
+
+    expect(registeredBeforeSend).toBe(true)
+    expect(h.pushed).toHaveLength(1)
+  })
+
+  it('leaves the unconfirmed path exactly as it was', async () => {
+    const h = makeSink()
+    const reported: string[] = []
+    const delivered = await deliverPreparedClaudeSessionStart({
+      prepared: { prompt: '배포 확인', localId: 'local-1', exitAfterFirstTurn: false },
+      sink: h.sink,
+      reportStarted: async () => { reported.push('reported') },
+    })
+    // No confirmDelivery supplied: BYOS behaviour, push happens immediately.
+    expect(delivered).toBe(true)
+    expect(h.pushed).toHaveLength(1)
+    expect(reported).toEqual(['reported'])
+  })
+})
+
+describe('required confirmation is a launch precondition', () => {
+  it('refuses when confirmation is required but there is no prompt to confirm', async () => {
+    const h = makeSink()
+    const reported: string[] = []
+    await expect(deliverPreparedClaudeSessionStart({
+      prepared: { prompt: null, requireConfirmedDelivery: true, exitAfterFirstTurn: false },
+      sink: h.sink,
+      confirmDelivery: async () => ({ ok: true }),
+      reportStarted: async () => { reported.push('reported') },
+    })).rejects.toThrowError(/prompt/)
+    // The option states a condition about the initial prompt landing; with no
+    // prompt that condition cannot be met, so nothing starts and nothing is
+    // reported.
+    expect(h.pushed).toEqual([])
+    expect(h.sent).toEqual([])
+    expect(reported).toEqual([])
+  })
+
+  it('refuses when confirmation is required but no confirmer was supplied', async () => {
+    const h = makeSink()
+    const reported: string[] = []
+    await expect(deliverPreparedClaudeSessionStart({
+      prepared: { prompt: 'x', localId: 'local-1', requireConfirmedDelivery: true, exitAfterFirstTurn: false },
+      sink: h.sink,
+      reportStarted: async () => { reported.push('reported') },
+    })).rejects.toThrowError(/confirm/)
+    expect(h.pushed).toEqual([])
+    expect(reported).toEqual([])
+  })
+
+  it('keeps the existing no-prompt behaviour when confirmation was not required', async () => {
+    const h = makeSink()
+    const reported: string[] = []
+    const delivered = await deliverPreparedClaudeSessionStart({
+      prepared: { prompt: null, exitAfterFirstTurn: false },
+      sink: h.sink,
+      reportStarted: async () => { reported.push('reported') },
+    })
+    expect(delivered).toBe(false)
+    expect(reported).toEqual(['reported'])
+  })
+})

@@ -15,6 +15,9 @@ export class Session {
     readonly client: ApiSessionClient;
     readonly queue: MessageQueue2<EnhancedMode>;
     readonly claudeEnvVars?: Record<string, string>;
+    readonly managedSettingsLockdown?: boolean;
+    /** A managed Cloud run: unbound instruction paths are closed. */
+    readonly managedRun?: boolean;
     claudeArgs?: string[];  // Made mutable to allow filtering
     mcpServers: Record<string, any>;
     readonly mcpConfig?: McpConfigSource;
@@ -49,6 +52,8 @@ export class Session {
         logPath: string,
         sessionId: string | null,
         claudeEnvVars?: Record<string, string>,
+        managedSettingsLockdown?: boolean,
+        managedRun?: boolean,
         claudeArgs?: string[],
         mcpServers: Record<string, any>,
         mcpConfig?: McpConfigSource,
@@ -76,6 +81,8 @@ export class Session {
         this.sessionId = opts.sessionId;
         this.queue = opts.messageQueue;
         this.claudeEnvVars = opts.claudeEnvVars;
+        this.managedSettingsLockdown = opts.managedSettingsLockdown;
+        this.managedRun = opts.managedRun;
         this.claudeArgs = opts.claudeArgs;
         this.mcpServers = opts.mcpServers;
         this.mcpConfig = opts.mcpConfig;

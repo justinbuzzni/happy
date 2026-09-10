@@ -53,7 +53,7 @@ describe('handleCodexCommand', () => {
 
     expect(mocks.mockEnsureDaemonRunning).toHaveBeenCalledTimes(1)
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      principal: { kind: 'account', credentials: { token: 'token' } },
       startedBy: 'terminal',
       noSandbox: false,
       resumeThreadId: undefined,
@@ -77,7 +77,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--no-sandbox', '--resume', 'thread-123', '--started-by', 'daemon'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      principal: { kind: 'account', credentials: { token: 'token' } },
       startedBy: 'daemon',
       noSandbox: true,
       resumeThreadId: 'thread-123',
@@ -89,7 +89,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--permission-mode', 'yolo'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      principal: { kind: 'account', credentials: { token: 'token' } },
       startedBy: undefined,
       noSandbox: false,
       resumeThreadId: undefined,
@@ -101,7 +101,7 @@ describe('handleCodexCommand', () => {
     await handleCodexCommand(['--yolo'])
 
     expect(mocks.mockRunCodex).toHaveBeenCalledWith({
-      credentials: { token: 'token' },
+      principal: { kind: 'account', credentials: { token: 'token' } },
       startedBy: undefined,
       noSandbox: false,
       resumeThreadId: undefined,

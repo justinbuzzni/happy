@@ -41,6 +41,12 @@ export interface QueryOptions {
     maxTurns?: number
     /** Emit Claude's predicted next user prompt after completed turns. */
     promptSuggestions?: boolean
+    /**
+     * 내장 도구 허용 목록. 빈 배열은 **전부 끈다**(`sdk.d.ts`: "Disable all
+     * built-in tools"). 이 자리가 없으면 관리 실행의 도구 경계가 SDK 까지
+     * 도달하지 못한다.
+     */
+    tools?: string[]
     mcpServers?: Record<string, unknown>
     permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     continue?: boolean

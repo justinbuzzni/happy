@@ -103,6 +103,53 @@ type V3PostSessionMessagesResponse = {
     }>;
 };
 
+/**
+ * Outcome of waiting for one message to be durably acknowledged.
+ *
+ * `ok: false` means the acknowledgement was not observed — **not** that the
+ * message was lost. A 2xx whose body omits our row leaves durability unknown,
+ * and a caller must treat it as "do not proceed", never as "it is gone".
+ */
+export type MessageAckOutcome =
+    | { ok: true; id: string; seq: number }
+    | { ok: false; reason: 'deadline' | 'closed' | 'sync-failed' | 'contradictory-ack' };
+
+/**
+ * Whether a server row is a usable acknowledgement for `localId`.
+ *
+ * Exported for the exhaustive shape tests; kept in this file because the
+ * acknowledgement map that consumes it is a concern of this class and moving
+ * one predicate out would not give it a second owner.
+ */
+export function readMessageAck(
+    rows: unknown,
+    localId: string,
+): { ok: true; id: string; seq: number } | { ok: false; reason: 'absent' | 'contradictory-ack' } {
+    // The body is network input: the declared type is a hope, not a guarantee.
+    if (!Array.isArray(rows)) return { ok: false, reason: 'absent' };
+    const matches = rows.filter((row) => (
+        row !== null && typeof row === 'object'
+        && (row as { localId?: unknown }).localId === localId
+    )) as Array<{ id?: unknown; seq?: unknown }>;
+    if (matches.length === 0) return { ok: false, reason: 'absent' };
+
+    const usable = matches.filter((row) => (
+        typeof row.id === 'string' && row.id.length > 0
+        && typeof row.seq === 'number' && Number.isSafeInteger(row.seq) && row.seq > 0
+    )) as Array<{ id: string; seq: number }>;
+    // A malformed row alongside a well-formed one is not a clean answer: the
+    // server is describing our localId twice and we cannot tell which is ours.
+    // Picking the valid one would turn an inconsistent response into a
+    // confirmation.
+    if (usable.length !== matches.length) return { ok: false, reason: 'contradictory-ack' };
+
+    const first = usable[0]!;
+    if (usable.some((row) => row.id !== first.id || row.seq !== first.seq)) {
+        return { ok: false, reason: 'contradictory-ack' };
+    }
+    return { ok: true, id: first.id, seq: first.seq };
+}
+
 type AttachmentUploadResult = {
     ref: string;
     uploadUrl: string;
@@ -241,6 +288,75 @@ function buildMultipartUploadBody(
     };
 }
 
+/**
+ * The managed relay contract, as the child must enforce it.
+ *
+ * `serverOrigin` is the exact origin every managed attachment URL must be on.
+ * A scoped bearer is only ever sent there, and never through a redirect.
+ */
+export type ManagedCredentialMode = {
+    serverOrigin: string;
+};
+
+/**
+ * Checks a URL the server handed back before a scoped bearer is sent to it.
+ *
+ * Exact origin, no credentials, and the path this session owns. A redirect is
+ * refused at the transport (`maxRedirects: 0`) rather than inspected, because a
+ * 302 is read after the request — and the request already carried the token.
+ */
+export function assertManagedAttachmentUrl(
+    raw: string,
+    managed: ManagedCredentialMode,
+    sessionId: string,
+): URL {
+    let parsed: URL;
+    try {
+        parsed = new URL(raw);
+    } catch {
+        throw new Error('managed attachment URL is not absolute');
+    }
+    if (parsed.origin !== managed.serverOrigin) {
+        throw new Error('managed attachment URL is not on the configured server origin');
+    }
+    if (parsed.username || parsed.password) {
+        throw new Error('managed attachment URL carries credentials');
+    }
+    const expected = `/v1/sessions/${encodeURIComponent(sessionId)}/attachments/`;
+    if (!parsed.pathname.startsWith(expected)) {
+        throw new Error('managed attachment URL is not under this session');
+    }
+    return parsed;
+}
+
+/**
+ * Requires the configured server and the managed relay origin to be the one
+ * origin, compared canonically.
+ *
+ * String equality on the raw values would call `https://relay.test` and
+ * `https://relay.test/` different, and `HTTPS://Relay.test` the same as
+ * nothing at all; `URL.origin` normalises scheme, host and port and drops
+ * everything that is not part of an origin.
+ */
+export function assertManagedServerOrigin(managed: ManagedCredentialMode): string {
+    let configured: string;
+    try {
+        configured = new URL(configuration.serverUrl).origin;
+    } catch {
+        throw new Error('managed mode requires an absolute server URL');
+    }
+    let expected: string;
+    try {
+        expected = new URL(managed.serverOrigin).origin;
+    } catch {
+        throw new Error('managed mode requires an absolute relay origin');
+    }
+    if (configured !== expected) {
+        throw new Error('managed relay origin does not match the configured server origin');
+    }
+    return expected;
+}
+
 export class ApiSessionClient extends EventEmitter {
     private readonly token: string;
     readonly sessionId: string;
@@ -310,6 +426,15 @@ export class ApiSessionClient extends EventEmitter {
     private runtimeProcessedSeqCap: number | null = null;
     private pendingOutbox: Array<{ content: string; localId: string }> = [];
     private readonly sendSync: InvalidateSync;
+    /**
+     * Callers waiting for a specific message to be acknowledged. Registered
+     * before the message is enqueued, because a flush can start immediately
+     * afterwards and a waiter added later would miss its own acknowledgement.
+     */
+    private readonly messageAckWaiters = new Map<string, {
+        settle: (outcome: MessageAckOutcome) => void;
+        timer: ReturnType<typeof setTimeout>;
+    }>();
     private readonly receiveSync: InvalidateSync;
     private receivePollInterval: NodeJS.Timeout | null = null;
     private currentThinking = false;
@@ -333,10 +458,39 @@ export class ApiSessionClient extends EventEmitter {
     private lastClaudeTurnResultUuid: string | null = null;
     private inputObservedForNextTurn = false;
     private launchedBackgroundJob = false;
+    /**
+     * Set only when the caller says so.
+     *
+     * Never inferred from the shape of the token or the key: a mode guessed
+     * from a credential is a mode that changes when the credential format
+     * does, and this one decides whether redirects are followed.
+     */
+    private readonly managed: ManagedCredentialMode | null;
 
-    constructor(token: string, session: Session) {
+    /** The origin this client is allowed to talk to, when it is a managed one. */
+    getManagedOrigin(): string | null {
+        return this.managed?.serverOrigin ?? null;
+    }
+
+    constructor(token: string, session: Session, managed?: ManagedCredentialMode) {
         super()
         this.token = token;
+        // Before the socket, before the handlers, before anything is sent.
+        //
+        // Every request below is built from `configuration.serverUrl`, which
+        // is process-wide and not this client's to own. A managed client that
+        // accepted a mismatch would put its scoped bearer wherever that value
+        // points — including the socket, which the constructor opens — and no
+        // check after the fact can recall it. Agreement is required up front
+        // rather than assumed to hold in some later configuration.
+        //
+        // What is kept is the *canonical* origin, not the text that was
+        // handed in. `HTTPS://Relay.test:443/` names the same origin as
+        // `https://relay.test` and is accepted as such, so storing the raw
+        // spelling would then fail every `URL.origin` comparison against it —
+        // the client would admit itself and refuse the very server it was
+        // configured for.
+        this.managed = managed ? { serverOrigin: assertManagedServerOrigin(managed) } : null;
         this.sessionId = session.id;
         this.metadata = session.metadata;
         this.metadataVersion = session.metadataVersion;
@@ -548,12 +702,16 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private async requestAttachmentUpload(filename: string, size: number): Promise<AttachmentUploadResult> {
+        const base = this.managed ? this.managed.serverOrigin : configuration.serverUrl;
         const response = await axios.post<AttachmentUploadResult>(
-            `${configuration.serverUrl}/v1/sessions/${encodeURIComponent(this.sessionId)}/attachments/request-upload`,
+            `${base}/v1/sessions/${encodeURIComponent(this.sessionId)}/attachments/request-upload`,
             { filename, size },
             {
                 headers: this.authHeaders(),
                 timeout: 30000,
+                // Managed: a redirect would carry the bearer somewhere this
+                // client never agreed to send it.
+                ...(this.managed ? { maxRedirects: 0 } : {}),
             },
         );
 
@@ -567,10 +725,17 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('request-upload returned an invalid response');
         }
 
-        return {
-            ...upload,
-            method: upload.method ?? 'PUT',
-        };
+        const method = upload.method ?? 'PUT';
+        if (this.managed) {
+            // The relay contract: this server, this session, a plain PUT. A
+            // presigned POST would carry its own authority to another origin.
+            if (method !== 'PUT') {
+                throw new Error('managed upload must be a PUT to the relay');
+            }
+            assertManagedAttachmentUrl(upload.uploadUrl, this.managed, this.sessionId);
+        }
+
+        return { ...upload, method };
     }
 
     private async uploadEncryptedAttachmentBlob(upload: AttachmentUploadResult, encrypted: Uint8Array): Promise<void> {
@@ -589,7 +754,10 @@ export class ApiSessionClient extends EventEmitter {
         const headers: Record<string, string> = {
             'Content-Type': 'application/octet-stream',
         };
-        if (upload.uploadUrl.startsWith(configuration.serverUrl)) {
+        if (this.managed) {
+            assertManagedAttachmentUrl(upload.uploadUrl, this.managed, this.sessionId);
+            headers.Authorization = `Bearer ${this.token}`;
+        } else if (upload.uploadUrl.startsWith(configuration.serverUrl)) {
             headers.Authorization = `Bearer ${this.token}`;
         }
 
@@ -597,6 +765,7 @@ export class ApiSessionClient extends EventEmitter {
             headers,
             timeout: 60000,
             maxBodyLength: 10 * 1024 * 1024,
+            ...(this.managed ? { maxRedirects: 0 } : {}),
         });
     }
 
@@ -625,13 +794,17 @@ export class ApiSessionClient extends EventEmitter {
      * presigned URL that does not accept extra headers.
      */
     async downloadAttachment(ref: string): Promise<Uint8Array> {
-        const requestUrl = `${configuration.serverUrl}/v1/sessions/${this.sessionId}/attachments/request-download`;
+        const base = this.managed ? this.managed.serverOrigin : configuration.serverUrl;
+        const requestUrl = `${base}/v1/sessions/${this.sessionId}/attachments/request-download`;
         const requestRes = await axios.post(
             requestUrl,
             { ref },
             {
                 headers: { 'Authorization': `Bearer ${this.token}`, 'Content-Type': 'application/json' },
                 timeout: 30000,
+                // Both metadata calls, not only the blob transfers: a redirect
+                // on this one carries the bearer just as far.
+                ...(this.managed ? { maxRedirects: 0 } : {}),
             },
         );
         const downloadUrl = requestRes.data?.downloadUrl;
@@ -639,16 +812,19 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('request-download returned no downloadUrl');
         }
 
-        const isServerUrl = downloadUrl.startsWith(configuration.serverUrl);
         const headers: Record<string, string> = {};
-        if (isServerUrl) {
+        if (this.managed) {
+            assertManagedAttachmentUrl(downloadUrl, this.managed, this.sessionId);
+            headers['Authorization'] = `Bearer ${this.token}`;
+        } else if (downloadUrl.startsWith(configuration.serverUrl)) {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
         const response = await axios.get(downloadUrl, {
             headers,
             responseType: 'arraybuffer',
             timeout: 60000,
-            maxRedirects: 5,
+            // BYOS follows a presigned redirect; managed never does.
+            maxRedirects: this.managed ? 0 : 5,
             maxContentLength: 10 * 1024 * 1024,
         });
         return new Uint8Array(response.data);
@@ -847,6 +1023,8 @@ export class ApiSessionClient extends EventEmitter {
             return;
         }
         this.syncFatalHandled = true;
+        // Nothing will be flushed after this, so no acknowledgement can arrive.
+        this.settleAllMessageAcks('sync-failed');
         // A sync 404/410 is NOT proof the session row is gone: happy-server
         // returns the identical 404 for "row deleted" and "row exists under
         // another account" (2026-07-23 incident — the session was alive, the
@@ -984,6 +1162,64 @@ export class ApiSessionClient extends EventEmitter {
             ), this.lastSeq);
             this.lastSeq = maxSeq;
             this.pendingOutbox.splice(0, batch.length);
+            // Resolution rides the existing flush rather than a second POST, so
+            // ordering against everything already queued is unchanged. Only the
+            // localIds this batch actually carried are considered: a response
+            // naming anything else must not confirm a message that has not been
+            // sent yet.
+            this.resolveMessageAcks(messages, new Set(batch.map((item) => item.localId)));
+        }
+    }
+
+    /**
+     * Waits for one enqueued message to be acknowledged by the server.
+     *
+     * Register before enqueuing. The returned promise always resolves: an
+     * unobserved acknowledgement is an outcome, not an exception, and a
+     * rejected promise nobody awaited would surface as an unhandled rejection.
+     */
+    awaitMessageAck(localId: string, deadlineMs: number): Promise<MessageAckOutcome> {
+        if (this.messageAckWaiters.has(localId)) {
+            throw new Error(`message ack waiter already registered for ${localId}`);
+        }
+        return new Promise<MessageAckOutcome>((resolve) => {
+            const settle = (outcome: MessageAckOutcome) => {
+                const entry = this.messageAckWaiters.get(localId);
+                if (!entry) return;
+                this.messageAckWaiters.delete(localId);
+                clearTimeout(entry.timer);
+                resolve(outcome);
+            };
+            const timer = setTimeout(() => settle({ ok: false, reason: 'deadline' }), deadlineMs);
+            timer.unref?.();
+            this.messageAckWaiters.set(localId, { settle, timer });
+            // Registering after the session already died would otherwise wait
+            // for a flush that will never run.
+            if (this.closed) settle({ ok: false, reason: 'closed' });
+            else if (this.syncFatalHandled) settle({ ok: false, reason: 'sync-failed' });
+        });
+    }
+
+    private resolveMessageAcks(
+        rows: ReadonlyArray<{ id: string; seq: number; localId: string | null }>,
+        sentLocalIds: ReadonlySet<string>,
+    ): void {
+        if (this.messageAckWaiters.size === 0) return;
+        for (const localId of [...this.messageAckWaiters.keys()]) {
+            if (!sentLocalIds.has(localId)) continue;
+            const ack = readMessageAck(rows, localId);
+            // `absent` is not a verdict: this batch simply did not carry it,
+            // and a later batch or the deadline decides.
+            if (ack.ok) this.messageAckWaiters.get(localId)?.settle(ack);
+            else if (ack.reason === 'contradictory-ack') {
+                this.messageAckWaiters.get(localId)?.settle({ ok: false, reason: 'contradictory-ack' });
+            }
+        }
+    }
+
+    private settleAllMessageAcks(reason: 'closed' | 'sync-failed'): void {
+        for (const localId of [...this.messageAckWaiters.keys()]) {
+            this.messageAckWaiters.get(localId)?.settle({ ok: false, reason });
         }
     }
 
@@ -1578,6 +1814,7 @@ export class ApiSessionClient extends EventEmitter {
         logger.debug('[API] socket.close() called');
         // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
         this.closed = true;
+        this.settleAllMessageAcks('closed');
         this.sendSync.stop();
         this.receiveSync.stop();
         this.stopReceivePolling();

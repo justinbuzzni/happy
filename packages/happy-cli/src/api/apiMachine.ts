@@ -21,6 +21,7 @@ import { homedir } from 'node:os';
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { createTerminalOutputCoalescer } from '@/daemon/terminalOutputCoalescer';
 import { backoff } from '@/utils/time';
+import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
@@ -390,6 +391,8 @@ async function withCodexAppServerClient<T>(handler: (client: CodexAppServerClien
 
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
+    /** Set when the managed credential ended; suppresses every reconnect. */
+    private credentialStopped = false;
     private keepAliveInterval: NodeJS.Timeout | null = null;
     private runtimeActivityProvider: (() => {
         activeSessionCount: number;
@@ -431,6 +434,8 @@ export class ApiMachineClient {
         callerWillLaunchBrowser: boolean;
         promise: Promise<ViewerStackStartResult>;
     } | null = null;
+    /** Set only on a verified managed runtime; null on every BYOS machine. */
+    private managedHandlers: ManagedRpcHandlers | null = null;
     private isolatedViewerLeases = new Map<string, BrowserViewerLeaseRecord>();
     private isolatedViewerStarts = new Map<string, Promise<IsolatedViewerStartResult>>();
     private isolatedViewerMutation: Promise<void> = Promise.resolve();
@@ -508,6 +513,14 @@ export class ApiMachineClient {
                 }),
             }),
         );
+    }
+
+    /**
+     * Enables the managed dispatch surface. Must be called before
+     * `setRPCHandlers`, which applies the restrictions as its last step.
+     */
+    setManagedRuntime(handlers: ManagedRpcHandlers): void {
+        this.managedHandlers = handlers;
     }
 
     setRPCHandlers({
@@ -1277,6 +1290,15 @@ export class ApiMachineClient {
         // RPC envelope can't be used. The preview payload is inherently
         // non-sensitive (it's the HTTP request flowing from the iframe,
         // and happy-server already sees it to rewrite HTML).
+
+        // Applied last so it wins over every legacy registration above,
+        // regardless of the order those modules ran in. On a BYOS machine
+        // `managedHandlers` is null and nothing below executes, so the
+        // existing surface is untouched.
+        if (this.managedHandlers) {
+            applyManagedRpcRestrictions(this.rpcHandlerManager);
+            registerManagedRpcHandlers(this.rpcHandlerManager, this.managedHandlers);
+        }
     }
 
     setAutomationKey(key: MachineAutomationKey, persistVersion: (version: number) => void, protocolVersion: number = AUTOMATION_PROTOCOL_VERSION): void {
@@ -2013,6 +2035,74 @@ export class ApiMachineClient {
         });
     }
 
+    /**
+     * Takes up a renewed credential — by **re-authenticating**, not by
+     * relabelling.
+     *
+     * Two things made the obvious version wrong.
+     *
+     * The handshake is what presents the credential, and it reads `socket.auth`
+     * at connect time, so changing only the field the constructor was given
+     * left every reconnect presenting the expired token: the connection alive
+     * today keeps working, and the first network flap ends the runtime in a way
+     * that reads as a network fault and never resolves.
+     *
+     * And the live connection is **not** fine as it is. The server re-reads the
+     * grant on every event against the token the handshake carried, and a
+     * renewal supersedes the previous grant the moment it is issued — so a
+     * connection still presenting the old bearer begins being refused
+     * immediately, and is dropped by the server's own revalidation shortly
+     * after. An earlier version of this comment claimed a live socket did not
+     * need the new token; that was wrong, and this is the correction.
+     *
+     * So the connection is dropped and the reconnect path brings it back
+     * authenticated with the new bearer, re-registering its RPC methods as any
+     * reconnect does. A few seconds of connection is the cost; the alternative
+     * is a runtime that looks connected while every request it makes is
+     * refused.
+     */
+    replaceToken(token: string): void {
+        if (token.trim() === '') throw new Error('a machine client cannot present an empty token');
+        if (token === this.token) return;
+        this.token = token;
+        if (!this.socket) return;
+        this.socket.auth = { ...(this.socket.auth as Record<string, unknown>), token };
+        // Dropped, not closed for good: `disconnect` runs the reconnect path,
+        // which dials again with the auth just replaced.
+        if (this.socket.connected) this.socket.disconnect();
+    }
+
+    /**
+     * Stops presenting a credential that is no longer valid, and stops working.
+     *
+     * Called when the credential expired and no renewal replaced it. The socket
+     * is closed and reconnection is not attempted: a runtime that kept retrying
+     * with a dead credential would look like a connectivity failure to
+     * everybody, while the real answer — this runtime is no longer authorised —
+     * is one the parent already knows.
+     */
+    stopForExpiredCredential(): void {
+        logger.debug('[API MACHINE] Managed credential expired; closing the machine socket');
+        /*
+         * Set **before** closing, and it outlives the close.
+         *
+         * Closing fires `disconnect`, and the disconnect handler is what starts
+         * the reconnect loop — so without a stop that survives that event the
+         * runtime immediately begins retrying with the credential that just
+         * expired. `startSmartReconnect` checks this flag, which is why it is a
+         * field rather than a local decision here.
+         */
+        this.credentialStopped = true;
+        if (this.reconnectInterval) {
+            clearInterval(this.reconnectInterval);
+            this.reconnectInterval = null;
+        }
+        // The field is non-nullable and every other path assumes a socket
+        // exists; closing is what stops the traffic, and `disconnected` is what
+        // the rest of this class already checks.
+        this.socket?.close();
+    }
+
     connect() {
         const serverUrl = configuration.serverUrl.replace(/^http/, 'ws');
         logger.debug(`[API MACHINE] Connecting to ${serverUrl}`);
@@ -2124,7 +2214,9 @@ export class ApiMachineClient {
                 onActivity: (port) => this.touchBrokerViewerPort(port),
             },
         );
-        this.socket.on('proxy-ws-open', async (params, ack) => {
+        // Not attached on a managed runtime: the preview WebSocket proxy reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('proxy-ws-open', async (params, ack) => {
             ack(await this.previewWsProxy!.open(params));
         });
         this.socket.on('proxy-ws-data', (payload) => {
@@ -2146,7 +2238,9 @@ export class ApiMachineClient {
         const machineKey = this.machine.encryptionKey;
         const machineVariant = this.machine.encryptionVariant;
         const machineId = this.machine.id;
-        this.socket.on('terminal-open-fwd', async (msg, ack) => {
+        // Not attached on a managed runtime: the forwarded terminal opener reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('terminal-open-fwd', async (msg, ack) => {
             try {
                 const { sessionId, params } = msg || {};
                 if (!sessionId || typeof sessionId !== 'string') {
@@ -2278,7 +2372,9 @@ export class ApiMachineClient {
             }
         });
 
-        this.socket.on('terminal-frame-fwd', (msg) => {
+        // Not attached on a managed runtime: forwarded terminal frames reaches the host outside
+        // the RPC dispatch gate, so the allowlist there would not see it.
+        if (!this.managedHandlers) this.socket.on('terminal-frame-fwd', (msg) => {
             const { sessionId, data } = msg || {};
             const entry = getDaemonTerminalSession(sessionId);
             if (!entry || typeof data !== 'string') return;
@@ -2447,6 +2543,10 @@ export class ApiMachineClient {
     }
 
     private startSmartReconnect() {
+        // A runtime whose credential is gone does not reconnect. Retrying would
+        // present a dead bearer over and over while the parent already knows
+        // this runtime is not authorised.
+        if (this.credentialStopped) return;
         if (this.reconnectInterval) return;
 
         this.reconnectInterval = setInterval(() => {
@@ -2465,7 +2565,13 @@ export class ApiMachineClient {
 
         if (shouldReconnect()) {
             logger.debug('[API MACHINE] Network up + lid open — reconnecting in 1s');
-            setTimeout(() => { if (!this.socket.connected) this.socket.connect() }, 1000);
+            setTimeout(() => {
+                // Re-checked when it fires, not when it was scheduled. A stop
+                // that arrives in between leaves this timeout on the queue, and
+                // it would reconnect with the credential that just expired.
+                if (this.credentialStopped) return;
+                if (!this.socket.connected) this.socket.connect();
+            }, 1000);
         }
     }
 

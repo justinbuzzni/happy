@@ -20,6 +20,13 @@ export class RpcHandlerManager {
     private readonly encryptionVariant: 'legacy' | 'dataKey';
     private readonly logger: (message: string, data?: any) => void;
     private socket: Socket | null = null;
+    /**
+     * When set, only these methods are dispatched. Enforced here rather than at
+     * registration so a handler registered later — or one this class gains in a
+     * future change — cannot become a bypass simply by existing.
+     * Null on every BYOS machine, which leaves dispatch exactly as it was.
+     */
+    private managedAllowlist: ReadonlySet<string> | null = null;
 
     constructor(config: RpcHandlerConfig) {
         this.scopePrefix = config.scopePrefix;
@@ -47,6 +54,22 @@ export class RpcHandlerManager {
         }
     }
 
+    /**
+     * Restricts dispatch to `methods`. Irreversible for the life of the
+     * manager: a managed runtime never returns to the unrestricted surface.
+     */
+    setManagedAllowlist(methods: readonly string[]): void {
+        this.managedAllowlist = new Set(methods);
+    }
+
+    /** Registered method names without the machine scope prefix. */
+    listMethods(): string[] {
+        const prefix = `${this.scopePrefix}:`;
+        return [...this.handlers.keys()].map((method) => (
+            method.startsWith(prefix) ? method.slice(prefix.length) : method
+        ));
+    }
+
     unregisterHandler(method: string): void {
         const prefixedMethod = this.getPrefixedMethod(method);
         this.handlers.delete(prefixedMethod);
@@ -65,6 +88,20 @@ export class RpcHandlerManager {
         request: RpcRequest,
     ): Promise<any> {
         try {
+            if (this.managedAllowlist) {
+                const prefix = `${this.scopePrefix}:`;
+                const bare = request.method.startsWith(prefix)
+                    ? request.method.slice(prefix.length)
+                    : request.method;
+                if (!this.managedAllowlist.has(bare)) {
+                    this.logger('[RPC] [MANAGED] Method not permitted', { method: request.method });
+                    return encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, {
+                        error: `${bare} is not available on a managed runtime; use the managed dispatch RPCs`,
+                        code: 'MANAGED_CAPABILITY_REQUIRED',
+                    }));
+                }
+            }
+
             const handler = this.handlers.get(request.method);
 
             if (!handler) {

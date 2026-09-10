@@ -102,10 +102,18 @@ import {
     consumePendingInitialSaycodeSystemPromptEnabled,
     resolveInitialPromptPermissionMode,
 } from '@/utils/initialPrompt';
+
 import { registerCodexSteerHandler } from './codexSteerHandler';
 import { createCheckpointSessionComposition } from '@/checkpoint/checkpointSessionComposition';
 import { createCheckpointEventPublisher } from '@/checkpoint/checkpointEventPublisher';
 import { describeCheckpointFailure } from '@/checkpoint/checkpointFailure';
+import { isManagedBrokerServer } from '@/launcher/codexApproval';
+import { resolveManagedCodexArguments } from '@/launcher/managedCodexOptions';
+import { applyManagedGatewayEnvironment, applyManagedInitialPrompt, assertManagedWorkingDirectory, clearForeignSessionLineage, managedCodexProviderArguments, requireAccountMachineId, requireAccountToken } from '@/managed/managedStartup';
+import type { RunnerPrincipal } from '@/claude/runClaude';
+
+/** See the Claude counterpart. */
+const CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS = 30_000;
 
 const DEFAULT_CODEX_MODEL = 'gpt-5.5';
 const DEFAULT_CODEX_EFFORT: ReasoningEffort = 'medium';
@@ -115,7 +123,7 @@ const DEFAULT_CODEX_PERMISSION_MODE: PermissionMode = 'yolo';
  * Main entry point for the codex command with ink UI
  */
 export async function runCodex(opts: {
-    credentials: Credentials;
+    principal: RunnerPrincipal;
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     resumeThreadId?: string;
@@ -123,6 +131,23 @@ export async function runCodex(opts: {
 }): Promise<void> {
     // Shield killall/pkill against broad kills before anything is spawned —
     // Codex has no PreToolUse hook system, so the PATH shim is its only guard.
+    const managedStartup = opts.principal?.kind === 'managed' ? opts.principal.startup : null;
+    const accountToken = opts.principal?.kind === 'account' ? opts.principal.credentials.token : null;
+    if (managedStartup) {
+        // Before every consumer, not merely before the API client. The initial
+        // prompt is read out of the environment a few lines below, so applying
+        // the envelope later means the child's first turn carries somebody
+        // else's prompt — or none, and no acknowledgement for the one it was
+        // launched to answer.
+        assertManagedWorkingDirectory(process.cwd());
+        // Before the reconnect environment is read, which happens within a few
+        // lines and would otherwise resume a session this run has nothing to
+        // do with — dropping its prompt on the way.
+        clearForeignSessionLineage(process.env);
+        applyManagedGatewayEnvironment(process.env, managedStartup.envelope);
+        applyManagedInitialPrompt(process.env, managedStartup.envelope);
+    }
+
     installBroadKillShims();
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = readReconnectSessionEnvironment(process.env);
@@ -162,7 +187,9 @@ export async function runCodex(opts: {
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Codex');
 
-    const api = await ApiClient.create(opts.credentials);
+    const api = opts.principal.kind === 'managed'
+        ? ApiClient.managed(opts.principal.startup.attachment)
+        : await ApiClient.create(opts.principal.credentials);
 
     // Log startup options
     logger.debug(`[codex] Starting with options: startedBy=${opts.startedBy || 'terminal'}`);
@@ -182,15 +209,20 @@ export async function runCodex(opts: {
         env: process.env,
         settings,
     });
-    if (!machineId) {
+    // See runClaude: a managed child has no account home and no machine id.
+    if (!machineId && !managedStartup) {
         console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    // A managed child has no machine of its own; the runtime it runs inside is
+    // the registered thing.
+    if (!managedStartup) {
+        await api.getOrCreateMachine({
+            machineId: requireAccountMachineId(machineId),
+            metadata: initialMachineMetadata
+        });
+    }
 
     //
     // Create session
@@ -206,7 +238,9 @@ export async function runCodex(opts: {
 
     const { state, metadata: freshMetadata } = createSessionMetadata({
         flavor: 'codex',
-        machineId,
+        // Discarded for a managed run: its session metadata comes from the
+        // server, opened with the key this process was handed.
+        machineId: machineId ?? '',
         startedBy: opts.startedBy,
         sandbox: sandboxConfig,
         dangerouslySkipPermissions: initialPermissionMode === 'yolo' || initialPermissionMode === 'bypassPermissions',
@@ -227,7 +261,11 @@ export async function runCodex(opts: {
     const metadata = mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata);
 
     let response: ApiSession | null;
-    if (reconnectSession) {
+    if (managedStartup) {
+        // Looked up, proven against the key this process holds, and placed on
+        // the runtime's project root before anything reads the path.
+        response = managedStartup.attachment.session;
+    } else if (reconnectSession) {
         logger.debug(`[START] Reconnecting to existing session ${reconnectSessionId}`);
         response = {
             ...reconnectSession,
@@ -240,6 +278,7 @@ export async function runCodex(opts: {
     assertCodexAutomationServerAvailable({
         automationRunOnceRequested,
         serverAvailable: response !== null,
+        prepared: preparedInitialPrompt,
     });
     if (!response && sandboxConfig?.checkpointProtection) {
         throw new Error('checkpoint protection requires an authoritative server session');
@@ -254,7 +293,7 @@ export async function runCodex(opts: {
             env: process.env,
             checkpointEvents: sandboxConfig?.checkpointProtection
                 ? createCheckpointEventPublisher({
-                    token: opts.credentials.token,
+                    token: requireAccountToken(accountToken),
                     sessionId: response.id,
                     encryption: {
                         encryptionKey: response.encryptionKey,
@@ -354,6 +393,22 @@ export async function runCodex(opts: {
     };
 
     const handleUserMessage = createSerialAsyncHandler<UserMessage>(async (message) => {
+        // A managed run answers exactly the prompt its envelope was admitted
+        // for. A message posted to this session by the account owner arrives
+        // here as an ordinary user turn: it would change the model, the
+        // permission mode and the system prompt, then queue another turn —
+        // spending this run's capability on work that passed no admission and
+        // silently replacing the selection that was priced. Refused before any
+        // of that happens; a new prompt needs a new run.
+        //
+        // This is the general free-text path only. Permission answers and tool
+        // responses arrive as their own RPCs, bound to an approval this run is
+        // already waiting on, and are untouched.
+        if (managedStartup) {
+            logger.debug('[managed] Refusing a user turn that did not come from an admitted run');
+            return;
+        }
+
         const attachmentsForThisMessage = await session.drainAttachmentsForUserMessage();
 
         // Resolve permission mode (validated + downgrade-guarded in permissionMode.ts)
@@ -449,6 +504,17 @@ export async function runCodex(opts: {
     });
     session.onUserMessage(handleUserMessage);
     const initialPromptDelivered = await prepareCodexSessionStart({
+        // An offline start has no session to confirm against; the guard above
+        // (`assertCodexAutomationServerAvailable`) already refused that case,
+        // and `prepareCodexSessionStart` refuses again if no confirmer reaches
+        // it. This condition only supplies the confirmer when one can exist.
+        ...(preparedInitialPrompt.requireConfirmedDelivery && response
+            ? {
+                confirmDelivery: (localId: string) => session.awaitMessageAck(
+                    localId, CODEX_INITIAL_PROMPT_ACK_TIMEOUT_MS,
+                ),
+            }
+            : {}),
         prepared: preparedInitialPrompt,
         sendSessionMessage: (envelope, localId) => session.sendSessionProtocolMessage(envelope, localId),
         pushPrompt: (prompt) => {
@@ -724,11 +790,24 @@ export async function runCodex(opts: {
         checkpointComposition.sandboxConfig,
         checkpointComposition.beforeTurn,
         checkpointComposition.completeTurn,
+        // Explicit, and only ever from the verified envelope: it turns off the
+        // account-rotation proxy and pins the provider this run may use.
+        /*
+         * B2 의 provider 고정 인자 뒤에 이 run 의 도구 경계(broker 등록·자격
+         * 환경변수 이름·기능 차단·effort)를 얹는다. 관리 실행인데 검증된 계획이
+         * 없으면 기존 동작으로 되돌아가지 않고 멈춘다.
+         */
+        resolveManagedCodexArguments({
+            managed: managedStartup !== null,
+            env: process.env,
+            base: managedStartup ? managedCodexProviderArguments(managedStartup.envelope) : null,
+        }),
     );
 
     registerCodexSteerHandler({
         client,
         session,
+        managedRun: managedStartup !== null,
         onFailure: (message) => {
             logger.debug(`[Codex] Active-turn steer failed: ${message}`);
         },
@@ -804,6 +883,14 @@ export async function runCodex(opts: {
         if (!command) {
             throw new Error('Unsupported Codex goal action');
         }
+        if (managedStartup && command.type === 'set') {
+            // A managed run answers exactly the prompt its envelope was
+            // admitted for. A goal carries a free-text instruction into every
+            // turn after it — work no admission covered. Refused here, before
+            // the thread or the provider is touched; clearing a goal removes an
+            // instruction rather than adding one, so it stays.
+            throw new Error('A managed run cannot be given a new objective');
+        }
 
         const threadId = client.threadId;
         if (!threadId) {
@@ -830,6 +917,19 @@ export async function runCodex(opts: {
             : params.type === 'patch'
                 ? { changes: params.fileChanges }
                 : (params.input ?? {});
+
+        /*
+         * 이 run 이 스스로 등록한 broker 로의 호출은 사람에게 물을 것이 없다 —
+         * 그 서버를 등록한 것이 우리이고, 어떤 도구를 쓸 수 있는지는 broker 가
+         * grant scope 로 최종 강제한다. 그 밖의 승인은 전부 기존 경로 그대로다.
+         */
+        if (isManagedBrokerServer({
+            managed: managedStartup !== null,
+            env: process.env,
+            serverName: params.serverName,
+        })) {
+            return 'approved';
+        }
 
         try {
             const result = await permissionHandler.handleToolCall(params.callId, toolName, input, {
@@ -995,13 +1095,15 @@ export async function runCodex(opts: {
     // codex would otherwise fail to start the MCP server, the change_title tool would
     // not be visible to the model, and the model would improvise with shell echoes.
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const initialAplusMcpSnapshot = await fetchAplusMcpConfigSnapshot(
-        opts.credentials.token,
-        machineId,
+    // Account-only: the aplus MCP config belongs to a user, and a managed run
+    // has none. Skipped rather than attempted with a scoped bearer.
+    const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
+        accountToken,
+        requireAccountMachineId(machineId),
         { sessionId: session.sessionId },
     );
-    const initialAplusMcpResult = initialAplusMcpSnapshot.result;
-    for (const status of mcpConfigFailureStatuses(initialAplusMcpResult)) {
+    const initialAplusMcpResult = initialAplusMcpSnapshot?.result ?? null;
+    for (const status of initialAplusMcpResult ? mcpConfigFailureStatuses(initialAplusMcpResult) : []) {
         session.updateMetadata((currentMetadata) => ({
             ...currentMetadata,
             mcpServers: [
@@ -1010,7 +1112,7 @@ export async function runCodex(opts: {
             ],
         }));
     }
-    const initialAplusMcpServers = initialAplusMcpSnapshot.servers;
+    const initialAplusMcpServers = initialAplusMcpSnapshot?.servers ?? {};
     const baseMcpServers = {
         happy: {
             command: process.execPath,
@@ -1039,10 +1141,11 @@ export async function runCodex(opts: {
         fetchAplusServers: async () => {
             // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
             // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
-            await refreshMcpCallerGrantIfExpiring(opts.credentials.token, machineId);
+            const account = requireAccountMachineId(machineId);
+            await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account);
             return fetchAplusMcpServersResult(
-                opts.credentials.token,
-                machineId,
+                requireAccountToken(accountToken),
+                account,
                 { sessionId: session.sessionId, lifecycle: 'turn' },
             );
         },
